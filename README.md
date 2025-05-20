@@ -1,2 +1,2 @@
-# MovieLens-CLI-Recommender
-A powerful command-line movie recommendation system using collaborative filtering on the MovieLens 20M dataset. Features both user-based and item-based algorithms with an elegant CLI interface.
+# MovieLens-CLI-DM
+Comprehensive data science project on the MovieLens 20M dataset: implementing regression, classification, clustering, recommender systems, and association rule mining with detailed analysis and visualizations. Complete with data preprocessing and thorough evaluation metrics.
