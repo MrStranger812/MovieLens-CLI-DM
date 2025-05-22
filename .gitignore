@@ -177,3 +177,9 @@ archive.zip
 
 # Ruff stuff:
 .ruff_cache/
+data/raw/genome_scores.csv
+data/raw/genome_tags.csv
+data/raw/links.csv
+data/raw/movies.csv
+data/raw/ratings.csv
+data/raw/tags.csv
