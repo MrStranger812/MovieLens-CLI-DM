@@ -36,5 +36,37 @@ def explore():
     ratings_df, movies_df, tags_df = cleaner.load_data()
     cleaner.basic_info()
 
+@cli.command()
+def clean():
+    """Clean and preprocess the data."""
+    cleaner = DataCleaner()
+    ratings_df, movies_df, tags_df = cleaner.load_data()
+    
+    # Clean data
+    clean_ratings = cleaner.clean_ratings()
+    
+    console.print("[green]✓ Data cleaning completed![/green]")
+
+@cli.command()
+def summary():
+    """Show cleaning summary statistics."""
+    cleaner = DataCleaner()
+    cleaner.load_data()
+    cleaner.clean_all()
+    
+    summary = cleaner.get_cleaning_summary()
+    
+    # Display summary nicely
+    for dataset, stats in summary.items():
+        table = Table(title=f"{dataset.title()} Statistics")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        
+        for metric, value in stats.items():
+            table.add_row(metric.replace('_', ' ').title(), str(value))
+        
+        console.print(table)
+        console.print()
+        
 if __name__ == '__main__':
     cli()
