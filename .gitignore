@@ -184,3 +184,14 @@ data/raw/movies.csv
 data/raw/ratings.csv
 data/raw/tags.csv
 data/processed/ratings_cleaned.csv
+data/processed/movies_cleaned.csv
+data/processed/tags_cleaned.csv
+data/processed/feature_matrix.parquet
+data/processed/ml_ready_datasets.pkl
+data/processed/movie_features.parquet
+data/processed/movies_cleaned.parquet
+data/processed/preprocessing_cache.pkl
+data/processed/ratings_cleaned.parquet
+data/processed/tags_cleaned.parquet
+data/processed/transformers.pkl
+data/processed/user_features.parquet

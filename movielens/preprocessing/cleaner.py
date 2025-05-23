@@ -153,15 +153,31 @@ class DataCleaner:
     def clean_tags(self, save=True) -> pd.DataFrame:
         """Clean and preprocess tags data."""
         if self.tags_df is not None:
-            # Convert timestamp to datetime
-            self.tags_df['timestamp'] = pd.to_datetime(self.tags_df['timestamp'], unit='s')
+            # Create a copy to avoid SettingWithCopyWarning
+            self.tags_df = self.tags_df.copy()
+            
+            # Check the format of the timestamp column
+            sample_timestamp = str(self.tags_df['timestamp'].iloc[0])
+            
+            # Handle different timestamp formats
+            if '-' in sample_timestamp and ':' in sample_timestamp:
+                # It's already a datetime string
+                self.tags_df['timestamp'] = pd.to_datetime(self.tags_df['timestamp'])
+                self.console.print("[green]✓ Timestamps were already in datetime format[/green]")
+            else:
+                # It's a Unix timestamp
+                self.tags_df['timestamp'] = pd.to_datetime(self.tags_df['timestamp'], unit='s')
+                self.console.print("[green]✓ Timestamps converted from Unix format[/green]")
             
             # Remove rows with missing tags
             self.tags_df = self.tags_df.dropna(subset=['tag'])
             
             # Clean tag text (lowercase, strip whitespace)
             self.tags_df['tag_clean'] = self.tags_df['tag'].str.lower().str.strip()
-
+            
+            # Remove empty tags
+            self.tags_df = self.tags_df[self.tags_df['tag_clean'].notna() & (self.tags_df['tag_clean'] != '')]
+            
             self.console.print("[green]✓ Tags cleaned and timestamps converted[/green]")
 
             # Save cleaned data if requested
