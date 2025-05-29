@@ -23,7 +23,7 @@ import warnings
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 # Initialize pandarallel with 4 workers
-pandarallel.initialize(progress_bar=True, nb_workers=4, verbose=1)
+# pandarallel.initialize(progress_bar=True, nb_workers=4, verbose=1)
 
 class DataTransformer:
     """Advanced data transformation and feature engineering utilities with parallel processing."""
@@ -219,7 +219,7 @@ class DataTransformer:
         """Create comprehensive user-based features using parallel processing."""
         self.console.print("[cyan]Creating user features (pandarallel)...[/cyan]")
         
-        user_features = ratings_df.groupby('userId').parallel_apply(
+        user_features = ratings_df.groupby('userId').apply(
             lambda x: pd.Series({
                 'rating_count': len(x),
                 'rating_mean': x['rating'].mean(),
@@ -252,7 +252,7 @@ class DataTransformer:
         """Create comprehensive movie-based features using parallel processing."""
         self.console.print("[cyan]Creating movie features (pandarallel)...[/cyan]")
         
-        movie_features = ratings_df.groupby('movieId').parallel_apply(
+        movie_features = ratings_df.groupby('movieId').apply(
             lambda x: pd.Series({
                 'rating_count': len(x),
                 'rating_mean': x['rating'].mean(),
@@ -268,7 +268,7 @@ class DataTransformer:
         movie_features = movie_features.join(movies_df.set_index('movieId'), how='left')
         
         if 'genre_list' in movie_features.columns:
-            movie_features['genre_count'] = movie_features['genre_list'].parallel_apply(
+            movie_features['genre_count'] = movie_features['genre_list'].apply(
                 lambda x: len(x) if isinstance(x, list) else 0
             )
             
@@ -281,7 +281,7 @@ class DataTransformer:
             
             def create_genre_feature(genre):
                 if genre != '(no genres listed)':
-                    return movie_features['genre_list'].parallel_apply(
+                    return movie_features['genre_list'].apply(
                         lambda x: 1 if isinstance(x, list) and genre in x else 0
                     )
                 return pd.Series(0, index=movie_features.index)
@@ -322,7 +322,7 @@ class DataTransformer:
             return temp_df, pd.DataFrame(), pd.DataFrame()
         
         try:
-            user_temporal = temp_df.groupby('userId').parallel_apply(
+            user_temporal = temp_df.groupby('userId').apply(
                 lambda x: pd.Series({
                     'first_rating_date': x['timestamp'].min(),
                     'last_rating_date': x['timestamp'].max(),
@@ -345,7 +345,7 @@ class DataTransformer:
                 )
                 temp_df = temp_df.merge(movies_years, on='movieId', how='left')
             
-            movie_temporal = temp_df.groupby('movieId').parallel_apply(
+            movie_temporal = temp_df.groupby('movieId').apply(
                 lambda x: pd.Series({
                     'release_to_first_rating': (
                         (x['timestamp'].min() - pd.Timestamp(f"{int(x['year'].iloc[0])}-01-01")).days 
@@ -449,10 +449,10 @@ class DataTransformer:
         """Create features from movie tags using parallel processing."""
         self.console.print("[cyan]Creating tag-based features (parallel)...[/cyan]")
         
-        movie_tags = tags_df.groupby('movieId')['tag_clean'].parallel_apply(lambda x: ' '.join(x)).reset_index()
+        movie_tags = tags_df.groupby('movieId')['tag_clean'].apply(lambda x: ' '.join(x)).reset_index()
         movie_tags.columns = ['movieId', 'combined_tags']
         
-        tag_stats = tags_df.groupby('movieId').parallel_apply(
+        tag_stats = tags_df.groupby('movieId').apply(
             lambda x: pd.Series({
                 'total_tags': len(x),
                 'unique_tags': x['tag_clean'].nunique(),
@@ -498,7 +498,7 @@ class DataTransformer:
                 'sentiment_ratio': (positive_count - negative_count) / (total + 1)
             })
         
-        sentiment_features = movie_tags_complete['combined_tags'].parallel_apply(calculate_sentiment)
+        sentiment_features = movie_tags_complete['combined_tags'].apply(calculate_sentiment)
         sentiment_features.index = movie_tags_complete['movieId']
         
         n_topics = 10
@@ -532,7 +532,7 @@ class DataTransformer:
         
         high_ratings = ratings_df[ratings_df['rating'] >= 4.0][['userId', 'movieId']]
         
-        movie_tags_dict = tags_df.groupby('movieId')['tag_clean'].parallel_apply(lambda x: ' '.join(x)).to_dict()
+        movie_tags_dict = tags_df.groupby('movieId')['tag_clean'].apply(lambda x: ' '.join(x)).to_dict()
         
         user_ids = high_ratings['userId'].unique()
         batch_size = 10000
@@ -589,14 +589,14 @@ class DataTransformer:
                 return [f"{g1}_{g2}" for i, g1 in enumerate(genre_list) for g2 in genre_list[i+1:]]
             return []
         
-        genre_combos = movies_df['genre_list'].parallel_apply(create_genre_combinations)
+        genre_combos = movies_df['genre_list'].apply(create_genre_combinations)
         
         all_combos = [combo for combos in genre_combos if combos for combo in combos]
         combo_counts = pd.Series(all_combos).value_counts().head(20)
         
         def create_combo_feature(combo):
             g1, g2 = combo.split('_')
-            return movies_df['genre_list'].parallel_apply(
+            return movies_df['genre_list'].apply(
                 lambda x: 1 if isinstance(x, list) and g1 in x and g2 in x else 0
             )
         
@@ -609,16 +609,16 @@ class DataTransformer:
         
         genre_stats = pd.DataFrame(index=movies_df['movieId'])
         
-        genre_stats['genre_count'] = movies_df['genre_list'].parallel_apply(
+        genre_stats['genre_count'] = movies_df['genre_list'].apply(
             lambda x: len(x) if isinstance(x, list) else 0
         )
         genre_stats['is_single_genre'] = (genre_stats['genre_count'] == 1).astype(int)
         genre_stats['is_multi_genre'] = (genre_stats['genre_count'] > 1).astype(int)
-        genre_stats['genre_diversity'] = movies_df['genre_list'].parallel_apply(
+        genre_stats['genre_diversity'] = movies_df['genre_list'].apply(
             lambda x: len(set(x)) / len(x) if isinstance(x, list) and len(x) > 0 else 0
         )
         
-        movie_ratings = ratings_df.groupby('movieId').parallel_apply(
+        movie_ratings = ratings_df.groupby('movieId').apply(
             lambda x: pd.Series({
                 'avg_rating': x['rating'].mean(),
                 'num_ratings': len(x),
@@ -657,7 +657,7 @@ class DataTransformer:
         }
         
         for col_type in ['avg_genre_rating', 'genre_popularity', 'genre_rating_consistency']:
-            genre_stats[f'{col_type}_score'] = movies_df['genre_list'].parallel_apply(
+            genre_stats[f'{col_type}_score'] = movies_df['genre_list'].apply(
                 lambda genres: np.mean([
                     genre_performance.get(g, {}).get(col_type, 0) 
                     for g in genres if isinstance(genres, list) and g in genre_performance
@@ -667,7 +667,7 @@ class DataTransformer:
         genre_counts = pd.Series([g for genres in movies_df['genre_list'] 
                                 for g in genres if isinstance(genres, list)]).value_counts()
         
-        genre_stats['genre_rarity_score'] = movies_df['genre_list'].parallel_apply(
+        genre_stats['genre_rarity_score'] = movies_df['genre_list'].apply(
             lambda genres: np.mean([
                 1 / (genre_counts.get(g, 1) + 1) 
                 for g in genres if isinstance(genres, list)
@@ -763,7 +763,7 @@ class DataTransformer:
                     return np.mean(valid_ratings) if valid_ratings else 3.5
                 return 3.5
             
-            genre_expected_ratings = movies_df.set_index('movieId')['genres'].parallel_apply(calculate_expected_rating)
+            genre_expected_ratings = movies_df.set_index('movieId')['genres'].apply(calculate_expected_rating)
             movie_cold_features['genre_expected_rating'] = genre_expected_ratings.reindex(movie_cold_features.index, fill_value=3.5)
         
         content_features = [col for col in movie_features.columns 
@@ -1164,10 +1164,11 @@ class DataTransformer:
         
         user_features_list = []
         
-        def process_user_batch(batch_users):
-            batch_ratings = ratings_df[ratings_df['userId'].isin(batch_users)]
+        # Move this function OUTSIDE the Parallel call and make it independent
+        def process_user_batch_independent(batch_users, ratings_data):
+            batch_ratings = ratings_data[ratings_data['userId'].isin(batch_users)]
             
-            batch_features = batch_ratings.groupby('userId').parallel_apply(
+            batch_features = batch_ratings.groupby('userId').apply(
                 lambda x: pd.Series({
                     'rating_count': len(x),
                     'rating_mean': x['rating'].mean(),
@@ -1189,7 +1190,24 @@ class DataTransformer:
                 batch_features['rating_count'] / (batch_features['activity_span_days'] + 1)
             )
             
-            return self.optimize_dtypes(batch_features)
+            # Apply basic dtype optimization without using self
+            start_mem = batch_features.memory_usage(deep=True).sum() / 1024**2
+            
+            for col in batch_features.columns:
+                if batch_features[col].dtype == 'int64':
+                    col_min = batch_features[col].min()
+                    col_max = batch_features[col].max()
+                    
+                    if col_min >= -128 and col_max <= 127:
+                        batch_features[col] = batch_features[col].astype('int8')
+                    elif col_min >= -32768 and col_max <= 32767:
+                        batch_features[col] = batch_features[col].astype('int16')
+                    elif col_min >= -2147483648 and col_max <= 2147483647:
+                        batch_features[col] = batch_features[col].astype('int32')
+                elif batch_features[col].dtype == 'float64':
+                    batch_features[col] = batch_features[col].astype('float32')
+            
+            return batch_features
         
         with Progress(
             SpinnerColumn(),
@@ -1202,7 +1220,7 @@ class DataTransformer:
             task = progress.add_task("[cyan]Processing user batches...", total=n_batches)
             
             batch_results = Parallel(n_jobs=self.n_jobs)(
-                delayed(process_user_batch)(user_ids[i:i+batch_size]) 
+                delayed(process_user_batch_independent)(user_ids[i:i+batch_size], ratings_df) 
                 for i in range(0, len(user_ids), batch_size)
             )
             
@@ -1224,12 +1242,13 @@ class DataTransformer:
         self.console.print(f"[green]✓ Memory usage: {self.estimate_memory_usage(user_features):.2f}MB[/green]")
         return user_features
 
+
     def create_sparse_tfidf_features(self, tags_df: pd.DataFrame, movies_df: pd.DataFrame, 
                                     max_features: int = 100) -> Tuple[sparse.csr_matrix, pd.Index, TfidfVectorizer]:
         """Create sparse TF-IDF features to save memory using parallel processing."""
         self.console.print("[cyan]Creating sparse TF-IDF features (parallel)...[/cyan]")
         
-        movie_tags = tags_df.groupby('movieId')['tag_clean'].parallel_apply(lambda x: ' '.join(x)).reset_index()
+        movie_tags = tags_df.groupby('movieId')['tag_clean'].apply(lambda x: ' '.join(x)).reset_index()
         
         all_movies = pd.DataFrame({'movieId': movies_df['movieId']})
         movie_tags_complete = all_movies.merge(movie_tags, on='movieId', how='left')
