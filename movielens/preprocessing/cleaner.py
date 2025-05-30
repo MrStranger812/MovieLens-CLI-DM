@@ -17,7 +17,9 @@ class DataCleaner:
         self.movies_df = None
         self.tags_df = None
         self.console = Console()
-        PROCESSED_DATA_DIR.mkdir(exist_ok=True)
+        from ..config import PROCESSED_DATA_DIR
+        self.PROCESSED_DATA_DIR = PROCESSED_DATA_DIR
+        self.PROCESSED_DATA_DIR.mkdir(exist_ok=True)
         
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Load all dataset files with progress bar."""
@@ -116,10 +118,9 @@ class DataCleaner:
             # Save cleaned data if requested
             if save:
                 # Ensure processed directory exists
-                PROCESSED_DATA_DIR.mkdir(exist_ok=True)
-                
+                self.PROCESSED_DATA_DIR.mkdir(exist_ok=True)
                 # Save to processed directory
-                output_file = PROCESSED_DATA_DIR / "ratings_cleaned.csv"
+                output_file = self.PROCESSED_DATA_DIR / "ratings_cleaned.csv"
                 self.ratings_df.to_csv(output_file, index=False)
                 self.console.print(f"[green]✓ Cleaned ratings saved to {output_file}[/green]")
 
@@ -143,8 +144,8 @@ class DataCleaner:
 
             # Save cleaned data if requested
             if save:
-                PROCESSED_DATA_DIR.mkdir(exist_ok=True)
-                output_file = PROCESSED_DATA_DIR / "movies_cleaned.csv"
+                self.PROCESSED_DATA_DIR.mkdir(exist_ok=True)
+                output_file = self.PROCESSED_DATA_DIR / "movies_cleaned.csv"
                 self.movies_df.to_csv(output_file, index=False)
                 self.console.print(f"[green]✓ Cleaned movies saved to {output_file}[/green]")
 
@@ -182,8 +183,8 @@ class DataCleaner:
 
             # Save cleaned data if requested
             if save:
-                PROCESSED_DATA_DIR.mkdir(exist_ok=True)
-                output_file = PROCESSED_DATA_DIR / "tags_cleaned.csv"
+                self.PROCESSED_DATA_DIR.mkdir(exist_ok=True)
+                output_file = self.PROCESSED_DATA_DIR / "tags_cleaned.csv"
                 self.tags_df.to_csv(output_file, index=False)
                 self.console.print(f"[green]✓ Cleaned tags saved to {output_file}[/green]")
 

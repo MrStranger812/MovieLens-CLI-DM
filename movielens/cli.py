@@ -615,5 +615,102 @@ def display_benchmark_results(results: dict):
         console.print(f"💾 [blue]Most memory efficient: memory mode[/blue]")
         console.print(f"⚖️ [yellow]Best balance: balanced mode[/yellow]")
 
+
+class OptimizedPerformanceConfig:
+    """Optimized configuration for 20M+ record datasets."""
+    
+    def __init__(self, available_memory_gb: float = None):
+        import psutil
+        
+        # Auto-detect available memory if not provided
+        if available_memory_gb is None:
+            available_memory_gb = psutil.virtual_memory().available / 1024**3
+        
+        # Leave 20% memory buffer for system
+        self.memory_limit_gb = available_memory_gb * 0.8
+        
+        # Optimized batch sizes based on available memory
+        if self.memory_limit_gb < 8:
+            # Low memory mode
+            self.user_batch_size = 5_000
+            self.movie_batch_size = 2_500
+            self.chunk_size = 100_000
+            self.rating_sample_size = 500_000
+            self.max_tfidf_features = 50
+        elif self.memory_limit_gb < 16:
+            # Medium memory mode
+            self.user_batch_size = 10_000
+            self.movie_batch_size = 5_000
+            self.chunk_size = 500_000
+            self.rating_sample_size = 1_000_000
+            self.max_tfidf_features = 75
+        else:
+            # High memory mode
+            self.user_batch_size = 20_000
+            self.movie_batch_size = 10_000
+            self.chunk_size = 1_000_000
+            self.rating_sample_size = 2_000_000
+            self.max_tfidf_features = 100
+        
+        # Parallel processing settings
+        self.n_jobs = min(mp.cpu_count() - 1, 8)  # Leave one core free
+        self.use_sample_for_clustering = True
+        self.cluster_sample_size = min(50_000, self.chunk_size // 10)
+        
+        # Feature engineering settings
+        self.skip_expensive_features = self.memory_limit_gb < 8
+        self.use_sparse_matrices = True
+        self.compress_intermediate_results = True
+        
+        # Garbage collection settings
+        self.gc_interval = 5  # Run GC every 5 batches
+        self.log_memory_usage = True
+
+# Usage in preprocess command
+@cli.command()
+@click.option('--memory-limit', type=float, help='Memory limit in GB (auto-detected if not specified)')
+@click.option('--ultra-fast', is_flag=True, help='Use ultra-fast mode (may reduce feature quality)')
+def preprocess_optimized(memory_limit, ultra_fast):
+    """Run optimized preprocessing for very large datasets."""
+    
+    # Create optimized configuration
+    config = OptimizedPerformanceConfig(available_memory_gb=memory_limit)
+    
+    if ultra_fast:
+        config.user_batch_size = min(config.user_batch_size, 5000)
+        config.skip_expensive_features = True
+        config.use_sample_for_clustering = True
+        config.rating_sample_size = min(config.rating_sample_size, 500_000)
+    
+    console.print(Panel.fit(
+        f"[bold blue]Optimized Preprocessing Configuration[/bold blue]\n"
+        f"Memory Limit: {config.memory_limit_gb:.1f} GB\n"
+        f"User Batch Size: {config.user_batch_size:,}\n"
+        f"Rating Sample Size: {config.rating_sample_size:,}\n"
+        f"Parallel Workers: {config.n_jobs}\n"
+        f"Mode: {'Ultra-Fast' if ultra_fast else 'Balanced'}",
+        border_style="blue"
+    ))
+    
+    # Use the optimized transformer
+    from movielens.preprocessing.transformer import DataTransformer as OptimizedTransformer
+    
+    # Initialize pipeline with optimized transformer
+    pipeline = PreprocessingPipeline(n_jobs=config.n_jobs)
+    pipeline.transformer = OptimizedTransformer(n_jobs=config.n_jobs)
+    
+    # Run with optimized settings
+    results = pipeline.run_full_pipeline_with_monitoring(
+        create_sparse_matrices=config.use_sparse_matrices,
+        apply_pca=not config.skip_expensive_features,
+        save_results=True,
+        use_cache=True,
+        memory_limit_gb=config.memory_limit_gb,
+        validate_steps=not ultra_fast,
+        large_dataset_threshold=config.chunk_size,
+        sparse_tfidf_threshold=config.chunk_size // 2,
+        batch_size=config.user_batch_size
+    )
+
 if __name__ == '__main__':
     cli()

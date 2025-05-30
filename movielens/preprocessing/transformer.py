@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from pandarallel import pandarallel
 from typing import Tuple, Dict, List, Optional
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder, MultiLabelBinarizer
 from sklearn.decomposition import PCA, LatentDirichletAllocation
@@ -11,14 +10,15 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 from rich import box
-from ..config import *
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans  # Changed from KMeans for memory efficiency
 from joblib import Parallel, delayed
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from pathlib import Path
 import warnings
+import gc
+from ..config import *
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 # pandarallel.initialize(progress_bar=True, nb_workers=4, verbose=1)
 
 class DataTransformer:
-    """Advanced data transformation and feature engineering utilities with parallel processing."""
+    """Advanced data transformation and feature engineering utilities with memory-optimized parallel processing."""
     
     def __init__(self, n_jobs: int = 4):
         self.console = Console()
@@ -572,10 +572,26 @@ class DataTransformer:
         return user_tag_features
     
     def create_enhanced_genre_features(self, movies_df: pd.DataFrame, ratings_df: pd.DataFrame) -> pd.DataFrame:
-        """Create comprehensive genre-based features using parallel processing."""
-        self.console.print("[cyan]Creating enhanced genre features (parallel)...[/cyan]")
+        """Create comprehensive genre-based features with memory optimization."""
+        self.console.print("[cyan]Creating enhanced genre features (memory-optimized)...[/cyan]")
         
+        # Debug print to verify data structure
+        self.console.print(f"Debug: Processing {len(movies_df)} movies with genre features")
+        
+        # Initialize MultiLabelBinarizer
         mlb = MultiLabelBinarizer()
+        
+        # Ensure genre_list exists
+        if 'genre_list' not in movies_df.columns:
+            if 'genres' in movies_df.columns:
+                movies_df['genre_list'] = movies_df['genres'].apply(
+                    lambda x: x.split('|') if pd.notna(x) else []
+                )
+            else:
+                self.console.print("[red]Error: No genre information found in movies_df[/red]")
+                return pd.DataFrame(index=movies_df['movieId'])
+        
+        # Create binary genre features
         genre_matrix = mlb.fit_transform(movies_df['genre_list'])
         
         genre_binary = pd.DataFrame(
@@ -584,29 +600,24 @@ class DataTransformer:
             index=movies_df['movieId']
         )
         
-        def create_genre_combinations(genre_list):
-            if isinstance(genre_list, list):
-                return [f"{g1}_{g2}" for i, g1 in enumerate(genre_list) for g2 in genre_list[i+1:]]
-            return []
+        # Create genre combination features (top 20 only for memory efficiency)
+        genre_combos_list = []
+        for idx, genre_list in enumerate(movies_df['genre_list']):
+            if isinstance(genre_list, list) and len(genre_list) > 1:
+                for i, g1 in enumerate(genre_list):
+                    for g2 in genre_list[i+1:]:
+                        genre_combos_list.append(f"{g1}_{g2}")
         
-        genre_combos = movies_df['genre_list'].apply(create_genre_combinations)
+        if genre_combos_list:
+            combo_counts = pd.Series(genre_combos_list).value_counts().head(20)
+            
+            for combo in combo_counts.index:
+                g1, g2 = combo.split('_')
+                genre_binary[f'combo_{combo}'.lower()] = movies_df['genre_list'].apply(
+                    lambda x: 1 if isinstance(x, list) and g1 in x and g2 in x else 0
+                )
         
-        all_combos = [combo for combos in genre_combos if combos for combo in combos]
-        combo_counts = pd.Series(all_combos).value_counts().head(20)
-        
-        def create_combo_feature(combo):
-            g1, g2 = combo.split('_')
-            return movies_df['genre_list'].apply(
-                lambda x: 1 if isinstance(x, list) and g1 in x and g2 in x else 0
-            )
-        
-        combo_features = Parallel(n_jobs=self.n_jobs)(
-            delayed(create_combo_feature)(combo) for combo in combo_counts.index
-        )
-        
-        for i, combo in enumerate(combo_counts.index):
-            genre_binary[f'combo_{combo}'.lower()] = combo_features[i].values
-        
+        # Create genre statistics
         genre_stats = pd.DataFrame(index=movies_df['movieId'])
         
         genre_stats['genre_count'] = movies_df['genre_list'].apply(
@@ -618,54 +629,53 @@ class DataTransformer:
             lambda x: len(set(x)) / len(x) if isinstance(x, list) and len(x) > 0 else 0
         )
         
-        movie_ratings = ratings_df.groupby('movieId').apply(
-            lambda x: pd.Series({
-                'avg_rating': x['rating'].mean(),
-                'num_ratings': len(x),
-                'rating_std': x['rating'].std()
-            })
-        )
+        # Calculate genre performance metrics using a sample to avoid memory issues
+        if len(ratings_df) > 1_000_000:
+            self.console.print("[yellow]Using rating sample for genre performance calculation[/yellow]")
+            rating_sample = ratings_df.sample(n=1_000_000, random_state=42)
+        else:
+            rating_sample = ratings_df
         
-        def calculate_genre_performance(genre):
+        # Calculate movie-level statistics first
+        movie_stats = rating_sample.groupby('movieId').agg({
+            'rating': ['mean', 'count', 'std']
+        })
+        movie_stats.columns = ['avg_rating', 'num_ratings', 'rating_std']
+        movie_stats['rating_std'] = movie_stats['rating_std'].fillna(0)
+        
+        # Calculate genre performance
+        genre_performance = {}
+        for genre in mlb.classes_:
             if genre != '(no genres listed)':
-                genre_movies = movies_df[movies_df['genre_list'].apply(
+                # Get movies with this genre
+                genre_mask = movies_df['genre_list'].apply(
                     lambda x: genre in x if isinstance(x, list) else False
-                )]['movieId']
+                )
+                genre_movie_ids = movies_df.loc[genre_mask, 'movieId'].values
                 
-                genre_ratings = movie_ratings[movie_ratings.index.isin(genre_movies)]
+                # Get stats for these movies
+                genre_movie_stats = movie_stats[movie_stats.index.isin(genre_movie_ids)]
                 
-                if len(genre_ratings) > 0:
-                    return {
-                        'genre': genre,
-                        'avg_genre_rating': genre_ratings['avg_rating'].mean(),
-                        'genre_popularity': genre_ratings['num_ratings'].sum(),
-                        'genre_rating_consistency': genre_ratings['rating_std'].mean()
+                if len(genre_movie_stats) > 0:
+                    genre_performance[genre] = {
+                        'avg_genre_rating': genre_movie_stats['avg_rating'].mean(),
+                        'genre_popularity': genre_movie_stats['num_ratings'].sum(),
+                        'genre_rating_consistency': genre_movie_stats['rating_std'].mean()
                     }
-            return None
         
-        genre_performance_results = Parallel(n_jobs=self.n_jobs)(
-            delayed(calculate_genre_performance)(genre) for genre in mlb.classes_
-        )
-        
-        genre_performance = {
-            result['genre']: {
-                'avg_genre_rating': result['avg_genre_rating'],
-                'genre_popularity': result['genre_popularity'],
-                'genre_rating_consistency': result['genre_rating_consistency']
-            }
-            for result in genre_performance_results if result is not None
-        }
-        
-        for col_type in ['avg_genre_rating', 'genre_popularity', 'genre_rating_consistency']:
-            genre_stats[f'{col_type}_score'] = movies_df['genre_list'].apply(
+        # Apply genre performance scores
+        for metric in ['avg_genre_rating', 'genre_popularity', 'genre_rating_consistency']:
+            genre_stats[f'{metric}_score'] = movies_df['genre_list'].apply(
                 lambda genres: np.mean([
-                    genre_performance.get(g, {}).get(col_type, 0) 
+                    genre_performance.get(g, {}).get(metric, 0) 
                     for g in genres if isinstance(genres, list) and g in genre_performance
                 ]) if isinstance(genres, list) and len(genres) > 0 else 0
             )
         
-        genre_counts = pd.Series([g for genres in movies_df['genre_list'] 
-                                for g in genres if isinstance(genres, list)]).value_counts()
+        # Calculate genre rarity
+        all_genres = [g for genres in movies_df['genre_list'] 
+                     for g in genres if isinstance(genres, list)]
+        genre_counts = pd.Series(all_genres).value_counts()
         
         genre_stats['genre_rarity_score'] = movies_df['genre_list'].apply(
             lambda genres: np.mean([
@@ -674,16 +684,31 @@ class DataTransformer:
             ]) if isinstance(genres, list) and len(genres) > 0 else 0
         )
         
+        # Combine all features
         genre_features = pd.concat([genre_binary, genre_stats], axis=1)
         
-        self.console.print(f"[green]✓ Created {genre_features.shape[1]} genre features using parallel processing[/green]")
-        return genre_features
-    
-    def create_cold_start_features(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame, 
-                               user_features: pd.DataFrame, movie_features: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Create features to handle cold start problem using parallel processing."""
-        self.console.print("[cyan]Creating cold start handling features (parallel)...[/cyan]")
+        # Optimize data types
+        genre_features = self.optimize_dtypes(genre_features)
         
+        # Debug print
+        self.console.print(f"Debug: Final genre features shape: {genre_features.shape}")
+        self.console.print(f"Debug: Data types: {dict(genre_features.dtypes.value_counts())}")
+        
+        self.console.print(f"[green]✓ Created {genre_features.shape[1]} genre features using parallel processing[/green]")
+        
+        # Clean up
+        del rating_sample, movie_stats
+        gc.collect()
+        
+        return genre_features
+
+
+    def create_cold_start_features(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame, 
+                                   user_features: pd.DataFrame, movie_features: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Create features to handle cold start problem with memory-optimized processing."""
+        self.console.print("[cyan]Creating cold start handling features (memory-optimized)...[/cyan]")
+        
+        # User cold start features
         user_cold_features = pd.DataFrame(index=user_features.index)
         
         user_rating_counts = ratings_df['userId'].value_counts()
@@ -692,46 +717,70 @@ class DataTransformer:
         user_cold_features['is_cold_start'] = (user_features['rating_count'] < cold_threshold).astype(int)
         user_cold_features['rating_confidence'] = 1 - np.exp(-user_features['rating_count'] / 10)
         
+        # Process cold users in small batches to avoid memory issues
         cold_users = user_cold_features[user_cold_features['is_cold_start'] == 1].index
         
-        def process_cold_user(user_id):
-            user_ratings = ratings_df[ratings_df['userId'] == user_id]
-            
-            if len(user_ratings) > 0:
-                preferred_hour = user_ratings['hour'].mode()[0] if 'hour' in user_ratings.columns else 12
-                preferred_day = user_ratings['day_of_week'].mode()[0] if 'day_of_week' in user_ratings.columns else 'Friday'
-                return {'user_id': user_id, 'preferred_hour': preferred_hour, 'preferred_day': preferred_day}
-            return {'user_id': user_id, 'preferred_hour': 12, 'preferred_day': 'Friday'}
-        
         if len(cold_users) > 0:
-            cold_user_results = Parallel(n_jobs=self.n_jobs)(
-                delayed(process_cold_user)(user_id) for user_id in cold_users
-            )
+            # Initialize with default values
+            user_cold_features.loc[cold_users, 'preferred_hour'] = 12
+            user_cold_features.loc[cold_users, 'preferred_day'] = 'Friday'
             
-            for result in cold_user_results:
-                user_cold_features.loc[result['user_id'], 'preferred_hour'] = result['preferred_hour']
-                user_cold_features.loc[result['user_id'], 'preferred_day'] = result['preferred_day']
+            # Process in small batches
+            batch_size = 1000
+            for i in range(0, len(cold_users), batch_size):
+                batch_users = cold_users[i:i+batch_size]
+                batch_ratings = ratings_df[ratings_df['userId'].isin(batch_users)]
+                
+                if len(batch_ratings) > 0 and 'hour' in batch_ratings.columns:
+                    user_modes = batch_ratings.groupby('userId').agg({
+                        'hour': lambda x: x.mode()[0] if len(x.mode()) > 0 else 12,
+                        'day_of_week': lambda x: x.mode()[0] if len(x.mode()) > 0 else 'Friday'
+                    })
+                    
+                    for col in ['hour', 'day_of_week']:
+                        col_name = 'preferred_hour' if col == 'hour' else 'preferred_day'
+                        if col in user_modes.columns:
+                            user_cold_features.loc[user_modes.index, col_name] = user_modes[col]
+                
+                # Clear memory
+                del batch_ratings
+                gc.collect()
         
+        # User clustering with memory-efficient MiniBatchKMeans
         time_features = ['rating_count', 'activity_span_days', 'rating_frequency']
         available_time_features = [f for f in time_features if f in user_features.columns]
         
-        if available_time_features:
+        if available_time_features and len(user_features) > 100:
             scaler = StandardScaler()
             user_time_scaled = scaler.fit_transform(user_features[available_time_features].fillna(0))
             
             n_clusters = min(20, len(user_features) // 100)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            # Use MiniBatchKMeans instead of KMeans for memory efficiency
+            kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=1000, random_state=42)
             user_cold_features['user_cluster'] = kmeans.fit_predict(user_time_scaled)
             
-            cluster_stats = ratings_df.merge(
-                user_cold_features[['user_cluster']], 
-                left_on='userId', 
-                right_index=True
-            ).groupby('user_cluster')['rating'].agg(['mean', 'std'])
+            # Calculate cluster stats in batches to avoid memory issues
+            self.console.print("[cyan]Calculating user cluster statistics in batches...[/cyan]")
             
-            user_cold_features['cluster_avg_rating'] = user_cold_features['user_cluster'].map(cluster_stats['mean'])
-            user_cold_features['cluster_rating_std'] = user_cold_features['user_cluster'].map(cluster_stats['std'])
+            # First, add cluster info to a subset of ratings to calculate stats
+            sample_size = min(1_000_000, len(ratings_df))
+            ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
+            
+            # Create a mapping of user to cluster
+            user_cluster_map = user_cold_features['user_cluster'].to_dict()
+            ratings_sample['user_cluster'] = ratings_sample['userId'].map(user_cluster_map)
+            
+            # Calculate cluster stats on the sample
+            cluster_stats = ratings_sample.groupby('user_cluster')['rating'].agg(['mean', 'std']).fillna(3.5)
+            
+            user_cold_features['cluster_avg_rating'] = user_cold_features['user_cluster'].map(cluster_stats['mean']).fillna(3.5)
+            user_cold_features['cluster_rating_std'] = user_cold_features['user_cluster'].map(cluster_stats['std']).fillna(0.5)
+            
+            # Clean up
+            del ratings_sample, user_time_scaled
+            gc.collect()
         
+        # Movie cold start features
         movie_cold_features = pd.DataFrame(index=movie_features.index)
         
         movie_rating_counts = ratings_df['movieId'].value_counts()
@@ -740,61 +789,112 @@ class DataTransformer:
         movie_cold_features['is_cold_start'] = (movie_features['rating_count'] < movie_cold_threshold).astype(int)
         movie_cold_features['rating_confidence'] = 1 - np.exp(-movie_features['rating_count'] / 10)
         
+        # Genre-based expected ratings with batch processing
         if 'genres' in movies_df.columns:
-            def calculate_genre_rating(genre):
-                if genre and genre != '(no genres listed)':
-                    genre_movies = movies_df[movies_df['genres'].str.contains(genre, na=False)]['movieId']
-                    genre_ratings = ratings_df[ratings_df['movieId'].isin(genre_movies)]
-                    if len(genre_ratings) > 0:
-                        return {'genre': genre, 'avg_rating': genre_ratings['rating'].mean()}
-                return {'genre': genre, 'avg_rating': 3.5}
+            self.console.print("[cyan]Calculating genre-based expected ratings...[/cyan]")
             
-            unique_genres = movies_df['genres'].str.split('|').explode().unique()
-            genre_rating_results = Parallel(n_jobs=self.n_jobs)(
-                delayed(calculate_genre_rating)(genre) for genre in unique_genres
+            # Calculate genre average ratings using a sample to avoid memory issues
+            sample_size = min(2_000_000, len(ratings_df))
+            ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
+            
+            # Merge with movie genres
+            ratings_with_genres = ratings_sample.merge(
+                movies_df[['movieId', 'genres']], 
+                on='movieId', 
+                how='left'
             )
             
-            genre_avg_ratings = {result['genre']: result['avg_rating'] for result in genre_rating_results}
+            # Calculate genre averages
+            genre_ratings = {}
+            unique_genres = set()
             
+            for genres_str in ratings_with_genres['genres'].dropna().unique():
+                if genres_str and genres_str != '(no genres listed)':
+                    for genre in genres_str.split('|'):
+                        unique_genres.add(genre)
+            
+            for genre in unique_genres:
+                if genre and genre != '(no genres listed)':
+                    mask = ratings_with_genres['genres'].str.contains(genre, na=False, regex=False)
+                    genre_ratings[genre] = ratings_with_genres.loc[mask, 'rating'].mean()
+            
+            # Apply genre expected ratings
             def calculate_expected_rating(genres_str):
-                if pd.notna(genres_str):
+                if pd.notna(genres_str) and genres_str != '(no genres listed)':
                     genres = genres_str.split('|')
-                    valid_ratings = [genre_avg_ratings.get(g, 3.5) for g in genres if g in genre_avg_ratings]
+                    valid_ratings = [genre_ratings.get(g, 3.5) for g in genres if g in genre_ratings]
                     return np.mean(valid_ratings) if valid_ratings else 3.5
                 return 3.5
             
-            genre_expected_ratings = movies_df.set_index('movieId')['genres'].apply(calculate_expected_rating)
-            movie_cold_features['genre_expected_rating'] = genre_expected_ratings.reindex(movie_cold_features.index, fill_value=3.5)
-        
-        content_features = [col for col in movie_features.columns 
-                        if col.startswith('genre_') or col.startswith('is_')]
-        
-        if content_features:
-            movie_content_scaled = StandardScaler().fit_transform(
-                movie_features[content_features].fillna(0)
-            )
+            genre_expected = movies_df.set_index('movieId')['genres'].apply(calculate_expected_rating)
+            movie_cold_features['genre_expected_rating'] = genre_expected.reindex(movie_cold_features.index, fill_value=3.5)
             
-            movie_kmeans = KMeans(n_clusters=min(50, len(movie_features) // 100), random_state=42)
+            # Clean up
+            del ratings_with_genres, ratings_sample
+            gc.collect()
+        
+        # Movie clustering with MiniBatchKMeans
+        content_features = [col for col in movie_features.columns 
+                           if col.startswith('genre_') or col.startswith('is_')]
+        
+        if content_features and len(movie_features) > 100:
+            self.console.print("[cyan]Clustering movies using content features...[/cyan]")
+            
+            # Fill NaN values and scale
+            movie_content = movie_features[content_features].fillna(0)
+            scaler = StandardScaler()
+            
+            # Process in chunks if dataset is large
+            if len(movie_content) > 10000:
+                # Use fit on a sample, then transform in batches
+                sample_indices = np.random.choice(len(movie_content), size=min(5000, len(movie_content)), replace=False)
+                scaler.fit(movie_content.iloc[sample_indices])
+                
+                # Transform in batches
+                batch_size = 5000
+                scaled_chunks = []
+                for i in range(0, len(movie_content), batch_size):
+                    chunk = movie_content.iloc[i:i+batch_size]
+                    scaled_chunks.append(scaler.transform(chunk))
+                
+                movie_content_scaled = np.vstack(scaled_chunks)
+            else:
+                movie_content_scaled = scaler.fit_transform(movie_content)
+            
+            # Use MiniBatchKMeans for memory efficiency
+            n_clusters = min(50, len(movie_features) // 100)
+            movie_kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=1000, random_state=42)
             movie_cold_features['movie_cluster'] = movie_kmeans.fit_predict(movie_content_scaled)
             
-            movie_cluster_stats = ratings_df.merge(
-                movie_cold_features[['movie_cluster']], 
-                left_on='movieId', 
-                right_index=True
-            ).groupby('movie_cluster')['rating'].agg(['mean', 'std', 'count'])
+            # Calculate cluster stats using a sample
+            sample_size = min(1_000_000, len(ratings_df))
+            ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
             
-            movie_cold_features['cluster_avg_rating'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['mean'])
-            movie_cold_features['cluster_rating_std'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['std'])
-            movie_cold_features['cluster_popularity'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['count'])
+            # Create movie cluster mapping
+            movie_cluster_map = movie_cold_features['movie_cluster'].to_dict()
+            ratings_sample['movie_cluster'] = ratings_sample['movieId'].map(movie_cluster_map)
+            
+            # Calculate stats
+            movie_cluster_stats = ratings_sample.groupby('movie_cluster')['rating'].agg(['mean', 'std', 'count']).fillna(3.5)
+            
+            movie_cold_features['cluster_avg_rating'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['mean']).fillna(3.5)
+            movie_cold_features['cluster_rating_std'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['std']).fillna(0.5)
+            movie_cold_features['cluster_popularity'] = movie_cold_features['movie_cluster'].map(movie_cluster_stats['count']).fillna(1)
+            
+            # Clean up
+            del movie_content_scaled, ratings_sample
+            gc.collect()
         
+        # Global average rating
         global_avg_rating = ratings_df['rating'].mean()
         user_cold_features['global_avg_rating'] = global_avg_rating
         movie_cold_features['global_avg_rating'] = global_avg_rating
         
-        self.console.print(f"[green]✓ Created {user_cold_features.shape[1]} user cold start features using parallel processing[/green]")
-        self.console.print(f"[green]✓ Created {movie_cold_features.shape[1]} movie cold start features using parallel processing[/green]")
+        self.console.print(f"[green]✓ Created {user_cold_features.shape[1]} user cold start features[/green]")
+        self.console.print(f"[green]✓ Created {movie_cold_features.shape[1]} movie cold start features[/green]")
+        
         return user_cold_features, movie_cold_features
-    
+
     def encode_categorical_features(self, df: pd.DataFrame, categorical_columns: List[str], 
                                   method: str = 'label') -> pd.DataFrame:
         """Encode categorical features using parallel processing."""
@@ -1067,48 +1167,35 @@ class DataTransformer:
         self.console.print(f"[green]✓ Transformers loaded from {filepath}[/green]")
     
     def optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Optimize data types using parallel processing."""
-        self.console.print("[cyan]Optimizing data types for memory efficiency (parallel)...[/cyan]")
-        
-        start_mem = self.estimate_memory_usage(df)
+        """Optimize data types for memory efficiency."""
         df_optimized = df.copy()
         
-        def optimize_numeric_column(col):
-            if col in df_optimized.columns:
-                if df_optimized[col].dtype == 'int64':
-                    col_min = df_optimized[col].min()
-                    col_max = df_optimized[col].max()
-                    
-                    if col_min >= -128 and col_max <= 127:
-                        return col, 'int8'
-                    elif col_min >= -32768 and col_max <= 32767:
-                        return col, 'int16'
-                    elif col_min >= -2147483648 and col_max <= 2147483647:
-                        return col, 'int32'
-                elif df_optimized[col].dtype == 'float64':
-                    return col, 'float32'
-                elif df_optimized[col].dtype == 'object':
-                    num_unique = df_optimized[col].nunique()
-                    num_total = len(df_optimized[col])
-                    if num_unique / num_total < 0.5:
-                        return col, 'category'
-            return None
-        
-        optimization_results = Parallel(n_jobs=self.n_jobs)(
-            delayed(optimize_numeric_column)(col) for col in df_optimized.columns
-        )
-        
-        for result in optimization_results:
-            if result:
-                col, new_dtype = result
-                df_optimized[col] = df_optimized[col].astype(new_dtype)
-        
-        end_mem = self.estimate_memory_usage(df_optimized)
-        reduction_pct = (start_mem - end_mem) / start_mem * 100
-        
-        self.console.print(f"[green]✓ Memory reduced from {start_mem:.2f}MB to {end_mem:.2f}MB ({reduction_pct:.1f}% reduction) using parallel processing[/green]")
+        for col in df_optimized.columns:
+            col_type = df_optimized[col].dtype
+            
+            if col_type != 'object' and col_type != 'datetime64[ns]':
+                c_min = df_optimized[col].min()
+                c_max = df_optimized[col].max()
+                
+                if str(col_type)[:3] == 'int':
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int8)
+                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int16)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int32)
+                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int64)
+                else:
+                    if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                        df_optimized[col] = df_optimized[col].astype(np.float16)
+                    elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        df_optimized[col] = df_optimized[col].astype(np.float32)
+                    else:
+                        df_optimized[col] = df_optimized[col].astype(np.float64)
+
         return df_optimized
-    
+
     def estimate_memory_usage(self, df: pd.DataFrame) -> float:
         """Estimate memory usage of a dataframe in MB."""
         return df.memory_usage(deep=True).sum() / 1024**2
@@ -1148,66 +1235,24 @@ class DataTransformer:
         return pd.concat(chunks, ignore_index=True)
 
     def create_user_features_optimized(self, ratings_df: pd.DataFrame, 
-                                    batch_size: int = 10000) -> pd.DataFrame:
-        """Create user features with memory optimization for large datasets using parallel processing."""
-        self.console.print("[cyan]Creating user features (memory-optimized, parallel)...[/cyan]")
+                                      batch_size: int = 10000) -> pd.DataFrame:
+        """Create user features with enhanced memory optimization for very large datasets."""
+        self.console.print("[cyan]Creating user features (ultra memory-optimized)...[/cyan]")
         
         unique_users = ratings_df['userId'].nunique()
         if unique_users > 100000:
-            self.console.print(f"[yellow]Large dataset detected: {unique_users:,} users. Processing in batches...[/yellow]")
+            self.console.print(f"[yellow]Large dataset detected: {unique_users:,} users. Using optimized batch processing...[/yellow]")
         
+        # Ensure userId is categorical for memory efficiency
         if ratings_df['userId'].dtype != 'category':
             ratings_df['userId'] = ratings_df['userId'].astype('category')
         
-        user_ids = ratings_df['userId'].unique()
+        # Get unique users
+        user_ids = ratings_df['userId'].cat.categories
         n_batches = (len(user_ids) - 1) // batch_size + 1
         
+        # Process users in batches
         user_features_list = []
-        
-        # Move this function OUTSIDE the Parallel call and make it independent
-        def process_user_batch_independent(batch_users, ratings_data):
-            batch_ratings = ratings_data[ratings_data['userId'].isin(batch_users)]
-            
-            batch_features = batch_ratings.groupby('userId').apply(
-                lambda x: pd.Series({
-                    'rating_count': len(x),
-                    'rating_mean': x['rating'].mean(),
-                    'rating_std': x['rating'].std(),
-                    'rating_min': x['rating'].min(),
-                    'rating_max': x['rating'].max(),
-                    'movieId_nunique': x['movieId'].nunique(),
-                    'timestamp_min': x['timestamp'].min(),
-                    'timestamp_max': x['timestamp'].max()
-                })
-            )
-            
-            batch_features['rating_std'] = batch_features['rating_std'].fillna(0)
-            batch_features['activity_span_days'] = (
-                batch_features['timestamp_max'] - batch_features['timestamp_min']
-            ).dt.total_seconds() / (24 * 3600)
-            
-            batch_features['rating_frequency'] = (
-                batch_features['rating_count'] / (batch_features['activity_span_days'] + 1)
-            )
-            
-            # Apply basic dtype optimization without using self
-            start_mem = batch_features.memory_usage(deep=True).sum() / 1024**2
-            
-            for col in batch_features.columns:
-                if batch_features[col].dtype == 'int64':
-                    col_min = batch_features[col].min()
-                    col_max = batch_features[col].max()
-                    
-                    if col_min >= -128 and col_max <= 127:
-                        batch_features[col] = batch_features[col].astype('int8')
-                    elif col_min >= -32768 and col_max <= 32767:
-                        batch_features[col] = batch_features[col].astype('int16')
-                    elif col_min >= -2147483648 and col_max <= 2147483647:
-                        batch_features[col] = batch_features[col].astype('int32')
-                elif batch_features[col].dtype == 'float64':
-                    batch_features[col] = batch_features[col].astype('float32')
-            
-            return batch_features
         
         with Progress(
             SpinnerColumn(),
@@ -1219,29 +1264,74 @@ class DataTransformer:
         ) as progress:
             task = progress.add_task("[cyan]Processing user batches...", total=n_batches)
             
-            batch_results = Parallel(n_jobs=self.n_jobs)(
-                delayed(process_user_batch_independent)(user_ids[i:i+batch_size], ratings_df) 
-                for i in range(0, len(user_ids), batch_size)
-            )
-            
-            for result in batch_results:
-                user_features_list.append(result)
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(user_ids))
+                batch_users = user_ids[start_idx:end_idx]
+                
+                # Filter ratings for this batch
+                batch_ratings = ratings_df[ratings_df['userId'].isin(batch_users)]
+                
+                # Calculate features for this batch
+                batch_features = batch_ratings.groupby('userId').agg({
+                    'rating': ['count', 'mean', 'std', 'min', 'max'],
+                    'movieId': 'nunique',
+                    'timestamp': ['min', 'max']
+                })
+                
+                # Flatten column names
+                batch_features.columns = ['rating_count', 'rating_mean', 'rating_std', 
+                                         'rating_min', 'rating_max', 'movieId_nunique',
+                                         'timestamp_min', 'timestamp_max']
+                
+                # Calculate derived features
+                batch_features['rating_std'] = batch_features['rating_std'].fillna(0)
+                batch_features['activity_span_days'] = (
+                    batch_features['timestamp_max'] - batch_features['timestamp_min']
+                ).dt.total_seconds() / (24 * 3600)
+                
+                batch_features['rating_frequency'] = (
+                    batch_features['rating_count'] / (batch_features['activity_span_days'] + 1)
+                )
+                
+                batch_features['rating_range'] = batch_features['rating_max'] - batch_features['rating_min']
+                
+                # Optimize data types
+                for col in batch_features.columns:
+                    if batch_features[col].dtype == 'int64':
+                        batch_features[col] = pd.to_numeric(batch_features[col], downcast='integer')
+                    elif batch_features[col].dtype == 'float64':
+                        batch_features[col] = batch_features[col].astype('float32')
+                
+                user_features_list.append(batch_features)
+                
+                # Clear batch data from memory
+                del batch_ratings, batch_features
+                gc.collect()
+                
                 progress.advance(task)
         
-        user_features = pd.concat(user_features_list)
+        # Combine all batches
+        user_features = pd.concat(user_features_list, axis=0)
         
-        user_features['rating_range'] = user_features['rating_max'] - user_features['rating_min']
+        # Add binary features based on quantiles
         user_features['is_active_user'] = (
             user_features['rating_count'] > user_features['rating_count'].quantile(0.75)
         ).astype('int8')
+        
         user_features['is_picky_user'] = (
             user_features['rating_std'] > user_features['rating_std'].quantile(0.75)
         ).astype('int8')
         
+        # Final memory optimization
+        memory_before = self.estimate_memory_usage(user_features)
+        user_features = self.optimize_dtypes(user_features)
+        memory_after = self.estimate_memory_usage(user_features)
+        
         self.console.print(f"[green]✓ Created {len(user_features.columns)} user features for {len(user_features):,} users[/green]")
-        self.console.print(f"[green]✓ Memory usage: {self.estimate_memory_usage(user_features):.2f}MB[/green]")
+        self.console.print(f"[green]✓ Memory usage: {memory_after:.2f}MB (reduced from {memory_before:.2f}MB)[/green]")
+        
         return user_features
-
 
     def create_sparse_tfidf_features(self, tags_df: pd.DataFrame, movies_df: pd.DataFrame, 
                                     max_features: int = 100) -> Tuple[sparse.csr_matrix, pd.Index, TfidfVectorizer]:
@@ -1600,3 +1690,238 @@ class DataTransformer:
                 self.console.print(f"  ... and {len(fixes_applied) - 5} more fixes")
         
         return fixed_df
+
+    def validate_feature_types(self, df: pd.DataFrame, feature_name: str = "feature") -> pd.DataFrame:
+        """Validate and fix data types in feature DataFrames with detailed logging."""
+        self.console.print(f"[cyan]Validating {feature_name} data types...[/cyan]")
+        
+        initial_shape = df.shape
+        initial_memory = self.estimate_memory_usage(df)
+        
+        # Log initial state
+        self.console.print(f"[dim]Debug: Initial {feature_name} shape: {initial_shape}[/dim]")
+        self.console.print(f"[dim]Debug: Initial memory usage: {initial_memory:.2f}MB[/dim]")
+        
+        # Check for object columns that should be numeric
+        object_cols = df.select_dtypes(include=['object']).columns.tolist()
+        if object_cols:
+            self.console.print(f"[yellow]Found {len(object_cols)} object columns in {feature_name}: {object_cols[:5]}[/yellow]")
+            
+            for col in object_cols:
+                # Check if the column contains lists or other non-scalar values
+                sample_values = df[col].dropna().iloc[:5].tolist()
+                
+                if any(isinstance(val, (list, dict, tuple)) for val in sample_values):
+                    self.console.print(f"[red]Warning: Column '{col}' contains non-scalar values: {sample_values}[/red]")
+                    df = df.drop(columns=[col])
+                    continue
+                
+                # Try to convert to numeric
+                try:
+                    numeric_series = pd.to_numeric(df[col], errors='coerce')
+                    nan_count = numeric_series.isna().sum()
+                    original_nan_count = df[col].isna().sum()
+                    
+                    if nan_count > original_nan_count:
+                        self.console.print(f"[yellow]Column '{col}': {nan_count - original_nan_count} values became NaN during conversion[/yellow]")
+                    
+                    df[col] = numeric_series.fillna(0)
+                    self.console.print(f"[green]✓ Converted '{col}' to numeric[/green]")
+                    
+                except Exception as e:
+                    self.console.print(f"[red]Failed to convert '{col}' to numeric: {e}[/red]")
+                    df = df.drop(columns=[col])
+        
+        # Check for infinite values
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        inf_cols = []
+        for col in numeric_cols:
+            if np.isinf(df[col]).any():
+                inf_count = np.isinf(df[col]).sum()
+                df[col] = df[col].replace([np.inf, -np.inf], 0)
+                inf_cols.append((col, inf_count))
+        
+        if inf_cols:
+            self.console.print(f"[yellow]Replaced infinite values in {len(inf_cols)} columns[/yellow]")
+        
+        # Check for NaN values
+        nan_cols = []
+        for col in df.columns:
+            nan_count = df[col].isna().sum()
+            if nan_count > 0:
+                df[col] = df[col].fillna(0)
+                nan_cols.append((col, nan_count))
+        
+        if nan_cols:
+            self.console.print(f"[yellow]Filled NaN values in {len(nan_cols)} columns[/yellow]")
+        
+        # Optimize data types
+        for col in df.columns:
+            if df[col].dtype == 'float64':
+                df[col] = df[col].astype('float32')
+            elif df[col].dtype == 'int64':
+                col_min, col_max = df[col].min(), df[col].max()
+                if col_min >= -128 and col_max <= 127:
+                    df[col] = df[col].astype('int8')
+                elif col_min >= -32768 and col_max <= 32767:
+                    df[col] = df[col].astype('int16')
+                elif col_min >= -2147483648 and col_max <= 2147483647:
+                    df[col] = df[col].astype('int32')
+        
+        # Final validation
+        final_memory = self.estimate_memory_usage(df)
+        memory_reduction = ((initial_memory - final_memory) / initial_memory) * 100
+        
+        self.console.print(f"[green]✓ {feature_name} validation complete[/green]")
+        self.console.print(f"[dim]Debug: Final shape: {df.shape}[/dim]")
+        self.console.print(f"[dim]Debug: Final memory: {final_memory:.2f}MB ({memory_reduction:+.1f}% change)[/dim]")
+        self.console.print(f"[dim]Debug: Final dtypes: {df.dtypes.value_counts().to_dict()}[/dim]")
+        
+        return df
+
+    def log_feature_creation_step(self, step_name: str, data: pd.DataFrame, feature_count: int = None):
+        """Log detailed information about feature creation steps."""
+        if feature_count is None:
+            feature_count = len(data.columns) if hasattr(data, 'columns') else 0
+        
+        memory_usage = self.estimate_memory_usage(data) if hasattr(data, 'memory_usage') else 0
+        
+        self.console.print(f"[cyan]Feature Creation Step: {step_name}[/cyan]")
+        self.console.print(f"[dim]  → Created {feature_count} features[/dim]")
+        self.console.print(f"[dim]  → Data shape: {data.shape if hasattr(data, 'shape') else 'N/A'}[/dim]")
+        self.console.print(f"[dim]  → Memory usage: {memory_usage:.2f}MB[/dim]")
+        
+        if hasattr(data, 'dtypes'):
+            dtype_counts = data.dtypes.value_counts()
+            self.console.print(f"[dim]  → Data types: {dtype_counts.to_dict()}[/dim]")
+
+    def validate_matrix_for_scaling(self, matrix: pd.DataFrame, matrix_name: str = "matrix") -> pd.DataFrame:
+        """Validate that a matrix is ready for scaling operations (StandardScaler, etc.)."""
+        self.console.print(f"[cyan]Validating {matrix_name} for scaling operations...[/cyan]")
+        
+        if matrix.empty:
+            self.console.print(f"[red]Error: {matrix_name} is empty[/red]")
+            return matrix
+        
+        # Check for non-numeric columns
+        non_numeric = matrix.select_dtypes(exclude=[np.number]).columns.tolist()
+        if non_numeric:
+            self.console.print(f"[yellow]Removing {len(non_numeric)} non-numeric columns from {matrix_name}: {non_numeric[:5]}[/yellow]")
+            matrix = matrix.select_dtypes(include=[np.number])
+        
+        # Check for constant columns (will cause issues with StandardScaler)
+        constant_cols = []
+        for col in matrix.columns:
+            if matrix[col].nunique() <= 1:
+                constant_cols.append(col)
+        
+        if constant_cols:
+            self.console.print(f"[yellow]Removing {len(constant_cols)} constant columns from {matrix_name}: {constant_cols[:5]}[/yellow]")
+            matrix = matrix.drop(columns=constant_cols)
+        
+        # Check for columns with all NaN
+        all_nan_cols = []
+        for col in matrix.columns:
+            if matrix[col].isna().all():
+                all_nan_cols.append(col)
+        
+        if all_nan_cols:
+            self.console.print(f"[yellow]Removing {len(all_nan_cols)} all-NaN columns from {matrix_name}: {all_nan_cols[:5]}[/yellow]")
+            matrix = matrix.drop(columns=all_nan_cols)
+        
+        # Fill remaining NaN values
+        nan_count = matrix.isna().sum().sum()
+        if nan_count > 0:
+            self.console.print(f"[yellow]Filling {nan_count} NaN values in {matrix_name}[/yellow]")
+            matrix = matrix.fillna(0)
+        
+        # Check for infinite values
+        inf_count = np.isinf(matrix.select_dtypes(include=[np.number])).sum().sum()
+        if inf_count > 0:
+            self.console.print(f"[yellow]Replacing {inf_count} infinite values in {matrix_name}[/yellow]")
+            matrix = matrix.replace([np.inf, -np.inf], 0)
+        
+        # Final validation - try to convert to numpy array
+        try:
+            test_array = matrix.values
+            if test_array.dtype == 'object':
+                self.console.print(f"[red]Error: {matrix_name} still contains object dtype after cleaning[/red]")
+                # Try to identify problematic columns
+                for col in matrix.columns:
+                    try:
+                        _ = np.array(matrix[col], dtype=float)
+                    except:
+                        self.console.print(f"[red]Problematic column in {matrix_name}: {col}[/red]")
+                return pd.DataFrame()  # Return empty DataFrame
+            
+            self.console.print(f"[green]✓ {matrix_name} validated for scaling: {matrix.shape}[/green]")
+            return matrix
+            
+        except Exception as e:
+            self.console.print(f"[red]Error validating {matrix_name} for scaling: {e}[/red]")
+            return pd.DataFrame()
+
+    def check_feature_compatibility(self, user_features: pd.DataFrame, movie_features: pd.DataFrame) -> Dict:
+        """Check compatibility between user and movie features before merging."""
+        self.console.print("[cyan]Checking feature compatibility...[/cyan]")
+        
+        compatibility_report = {
+            'user_features_valid': True,
+            'movie_features_valid': True,
+            'issues': [],
+            'warnings': []
+        }
+        
+        # Check user features
+        if user_features.empty:
+            compatibility_report['user_features_valid'] = False
+            compatibility_report['issues'].append("User features DataFrame is empty")
+        else:
+            # Check for problematic data types
+            object_cols = user_features.select_dtypes(include=['object']).columns.tolist()
+            if object_cols:
+                compatibility_report['warnings'].append(f"User features has object columns: {object_cols[:3]}")
+            
+            # Check for list-valued columns
+            for col in user_features.columns:
+                sample_val = user_features[col].dropna().iloc[0] if not user_features[col].dropna().empty else None
+                if isinstance(sample_val, (list, dict, tuple)):
+                    compatibility_report['issues'].append(f"User feature '{col}' contains non-scalar values")
+        
+        # Check movie features
+        if movie_features.empty:
+            compatibility_report['movie_features_valid'] = False
+            compatibility_report['issues'].append("Movie features DataFrame is empty")
+        else:
+            # Check for problematic data types
+            object_cols = movie_features.select_dtypes(include=['object']).columns.tolist()
+            if object_cols:
+                compatibility_report['warnings'].append(f"Movie features has object columns: {object_cols[:3]}")
+            
+            # Check for list-valued columns
+            for col in movie_features.columns:
+                sample_val = movie_features[col].dropna().iloc[0] if not movie_features[col].dropna().empty else None
+                if isinstance(sample_val, (list, dict, tuple)):
+                    compatibility_report['issues'].append(f"Movie feature '{col}' contains non-scalar values")
+        
+        # Check for overlapping column names
+        if not user_features.empty and not movie_features.empty:
+            overlapping = set(user_features.columns) & set(movie_features.columns)
+            if overlapping:
+                compatibility_report['warnings'].append(f"Overlapping feature names: {list(overlapping)[:5]}")
+        
+        # Log results
+        if compatibility_report['issues']:
+            self.console.print("[red]Feature compatibility issues found:[/red]")
+            for issue in compatibility_report['issues']:
+                self.console.print(f"  ❌ {issue}")
+        
+        if compatibility_report['warnings']:
+            self.console.print("[yellow]Feature compatibility warnings:[/yellow]")
+            for warning in compatibility_report['warnings']:
+                self.console.print(f"  ⚠️  {warning}")
+        
+        if not compatibility_report['issues']:
+            self.console.print("[green]✓ Features are compatible[/green]")
+        
+        return compatibility_report
