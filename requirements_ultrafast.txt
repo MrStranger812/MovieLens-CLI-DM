@@ -1,0 +1,31 @@
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+scipy>=1.9.0
+rich>=12.0.0
+click>=8.0.0
+
+# Ultra-fast processing dependencies
+numba>=0.56.0              # JIT compilation for numerical operations
+swifter>=1.3.0             # Automatic pandas acceleration
+pandarallel>=1.6.0         # Parallel pandas operations
+modin[all]>=0.18.0         # Distributed dataframe operations
+dask[complete]>=2023.1.0   # Parallel computing
+pyarrow>=10.0.0            # Fast parquet I/O
+fastparquet>=0.8.0         # Alternative parquet engine
+bottleneck>=1.3.0          # Fast NumPy functions
+numexpr>=2.8.0             # Fast numerical expression evaluator
+tables>=3.7.0              # HDF5 support
+lz4>=4.0.0                 # Fast compression
+blosc>=1.10.0              # Ultra-fast compression
+
+# Optional GPU acceleration
+cupy>=11.0.0             # GPU arrays (requires CUDA)
+cudf>=22.0.0             # GPU DataFrames (requires CUDA)
+rapids>=22.0.0           # Full RAPIDS suite (requires CUDA)
+
+# Profiling and monitoring
+py-spy>=0.3.0              # Sampling profiler
+memory-profiler>=0.60.0    # Memory profiling
+line-profiler>=3.5.0       # Line-by-line profiling
