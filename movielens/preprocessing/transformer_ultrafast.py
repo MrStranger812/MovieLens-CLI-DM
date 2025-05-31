@@ -3,434 +3,739 @@ import numpy as np
 from typing import Tuple, Dict, List, Optional
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, MultiLabelBinarizer
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.cluster import MiniBatchKMeans
-from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import csr_matrix, coo_matrix, hstack
 from scipy import sparse
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 from joblib import Parallel, delayed
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import warnings
 import gc
 import numba
-from numba import jit, prange
-import swifter 
+from numba import jit, prange, njit
+import swifter
 from functools import lru_cache
 import pickle
+from sklearn.utils import murmurhash3_32
+
+# GPU imports with fallbacks
+try:
+    import cupy as cp
+    import cuml
+    from cuml.preprocessing import StandardScaler as CuStandardScaler
+    from cuml.preprocessing import MinMaxScaler as CuMinMaxScaler
+    from cuml.decomposition import PCA as CuPCA
+    from cuml.decomposition import TruncatedSVD as CuTruncatedSVD
+    from cuml.cluster import KMeans as CuKMeans
+    from cuml.manifold import TSNE as CuTSNE
+    from cuml.neighbors import NearestNeighbors as CuNearestNeighbors
+    from cuml.metrics import pairwise_distances as cu_pairwise_distances
+    from cuml.common import logger as cuml_logger
+    import rmm
+    GPU_AVAILABLE = True
+    print("[bold green]✓ GPU acceleration enabled with CuPy and cuML[/bold green]")
+except ImportError as e:
+    cp = np
+    GPU_AVAILABLE = False
+    print(f"[yellow]⚠ GPU libraries not available: {e}[/yellow]")
+    print("[yellow]Falling back to CPU-only processing[/yellow]")
 
 warnings.filterwarnings('ignore')
 
-# Enable numba JIT compilation for critical functions
-@jit(nopython=True, parallel=True, cache=True)
-def fast_groupby_stats(user_ids, ratings, movie_ids, n_users):
-    """Ultra-fast groupby statistics using numba."""
-    user_stats = np.zeros((n_users, 8), dtype=np.float32)
+class GPUMemoryManager:
+    """Manages GPU memory allocation and cleanup."""
     
+    def __init__(self):
+        self.gpu_available = GPU_AVAILABLE
+        if self.gpu_available:
+            try:
+                # Initialize RMM memory pool for better GPU memory management
+                rmm.reinitialize(pool_allocator=True)
+                self.memory_info = cp.cuda.runtime.memGetInfo()
+                self.total_memory = self.memory_info[1]
+                self.console = Console()
+                self.console.print(f"[green]✓ GPU Memory Pool initialized: {self.total_memory / 1024**3:.1f}GB total[/green]")
+            except Exception as e:
+                self.gpu_available = False
+                print(f"[yellow]GPU memory setup failed: {e}[/yellow]")
+    
+    def get_available_memory(self):
+        """Get available GPU memory in bytes."""
+        if not self.gpu_available:
+            return 0
+        free_mem, total_mem = cp.cuda.runtime.memGetInfo()
+        return free_mem
+    
+    def clear_cache(self):
+        """Clear GPU memory cache."""
+        if self.gpu_available:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+            gc.collect()
+    
+    def can_fit_array(self, shape, dtype=cp.float32):
+        """Check if array of given shape can fit in GPU memory."""
+        if not self.gpu_available:
+            return False
+        required_bytes = np.prod(shape) * cp.dtype(dtype).itemsize
+        available_bytes = self.get_available_memory()
+        return required_bytes < (available_bytes * 0.8)  # Use 80% of available memory
+
+# Enhanced numba functions for maximum speed (CPU fallback)
+@njit(parallel=True, cache=True, fastmath=True)
+def ultra_fast_groupby_stats(user_ids, ratings, movie_ids, timestamps, n_users):
+    """Ultra-fast groupby with all statistics in one pass."""
+    # Pre-allocate all statistics arrays
+    counts = np.zeros(n_users, dtype=np.int32)
+    sums = np.zeros(n_users, dtype=np.float32)
+    sum_squares = np.zeros(n_users, dtype=np.float32)
+    mins = np.full(n_users, 5.0, dtype=np.float32)
+    maxs = np.zeros(n_users, dtype=np.float32)
+    first_time = np.full(n_users, np.iinfo(np.int64).max, dtype=np.int64)
+    last_time = np.zeros(n_users, dtype=np.int64)
+    unique_movies = np.zeros((n_users, 1000), dtype=np.int32)  # Track up to 1000 movies per user
+    unique_counts = np.zeros(n_users, dtype=np.int32)
+    
+    # Single pass through data
     for i in prange(len(user_ids)):
         uid = user_ids[i]
-        user_stats[uid, 0] += 1  # count
-        user_stats[uid, 1] += ratings[i]  # sum for mean
-        user_stats[uid, 7] = movie_ids[i]  # track last movie (for unique count approximation)
+        rating = ratings[i]
+        movie = movie_ids[i]
+        timestamp = timestamps[i]
+        
+        counts[uid] += 1
+        sums[uid] += rating
+        sum_squares[uid] += rating * rating
+        
+        if rating < mins[uid]:
+            mins[uid] = rating
+        if rating > maxs[uid]:
+            maxs[uid] = rating
+            
+        if timestamp < first_time[uid]:
+            first_time[uid] = timestamp
+        if timestamp > last_time[uid]:
+            last_time[uid] = timestamp
+            
+        # Track unique movies (approximate)
+        if unique_counts[uid] < 1000:
+            unique_movies[uid, unique_counts[uid]] = movie
+            unique_counts[uid] += 1
     
-    # Calculate derived stats
+    # Calculate derived statistics
+    means = np.zeros(n_users, dtype=np.float32)
+    stds = np.zeros(n_users, dtype=np.float32)
+    
     for i in prange(n_users):
-        if user_stats[i, 0] > 0:
-            user_stats[i, 2] = user_stats[i, 1] / user_stats[i, 0]  # mean
+        if counts[i] > 0:
+            means[i] = sums[i] / counts[i]
+            if counts[i] > 1:
+                variance = (sum_squares[i] / counts[i]) - (means[i] * means[i])
+                if variance > 0:
+                    stds[i] = np.sqrt(variance)
     
-    return user_stats
+    return counts, means, stds, mins, maxs, first_time, last_time, unique_counts
 
-class UltraFastDataTransformer:
-    """Ultra-optimized data transformer for systems with 32GB+ RAM."""
+def gpu_groupby_stats(user_ids, ratings, movie_ids, timestamps, n_users):
+    """GPU-accelerated groupby statistics using CuPy."""
+    if not GPU_AVAILABLE:
+        return ultra_fast_groupby_stats(user_ids, ratings, movie_ids, timestamps, n_users)
     
-    def __init__(self, n_jobs: int = None):
+    # Transfer data to GPU
+    user_ids_gpu = cp.asarray(user_ids, dtype=cp.int32)
+    ratings_gpu = cp.asarray(ratings, dtype=cp.float32)
+    movie_ids_gpu = cp.asarray(movie_ids, dtype=cp.int32)
+    timestamps_gpu = cp.asarray(timestamps, dtype=cp.int64)
+    
+    # Pre-allocate GPU arrays
+    counts = cp.zeros(n_users, dtype=cp.int32)
+    sums = cp.zeros(n_users, dtype=cp.float32)
+    sum_squares = cp.zeros(n_users, dtype=cp.float32)
+    mins = cp.full(n_users, 5.0, dtype=cp.float32)
+    maxs = cp.zeros(n_users, dtype=cp.float32)
+    first_time = cp.full(n_users, cp.iinfo(cp.int64).max, dtype=cp.int64)
+    last_time = cp.zeros(n_users, dtype=cp.int64)
+    unique_counts = cp.zeros(n_users, dtype=cp.int32)
+    
+    # GPU kernel for statistics computation
+    kernel = cp.ElementwiseKernel(
+        'int32 uid, float32 rating, int32 movie, int64 timestamp',
+        'raw int32 counts, raw float32 sums, raw float32 sum_squares, '
+        'raw float32 mins, raw float32 maxs, raw int64 first_time, raw int64 last_time',
+        '''
+        atomicAdd(&counts[uid], 1);
+        atomicAdd(&sums[uid], rating);
+        atomicAdd(&sum_squares[uid], rating * rating);
+        atomicMin(&mins[uid], rating);
+        atomicMax(&maxs[uid], rating);
+        atomicMin(&first_time[uid], timestamp);
+        atomicMax(&last_time[uid], timestamp);
+        ''',
+        'gpu_stats_kernel'
+    )
+    
+    # Execute kernel
+    kernel(user_ids_gpu, ratings_gpu, movie_ids_gpu, timestamps_gpu,
+           counts, sums, sum_squares, mins, maxs, first_time, last_time)
+    
+    # Calculate derived statistics on GPU
+    means = cp.divide(sums, cp.maximum(counts, 1))
+    variances = cp.divide(sum_squares, cp.maximum(counts, 1)) - means**2
+    stds = cp.sqrt(cp.maximum(variances, 0))
+    
+    # Transfer results back to CPU
+    return (cp.asnumpy(counts), cp.asnumpy(means), cp.asnumpy(stds), 
+            cp.asnumpy(mins), cp.asnumpy(maxs), cp.asnumpy(first_time), 
+            cp.asnumpy(last_time), cp.asnumpy(unique_counts))
+
+@njit(parallel=True, cache=True)
+def fast_cluster_assignment(data, centroids):
+    """Ultra-fast cluster assignment using Euclidean distance."""
+    n_samples = data.shape[0]
+    n_clusters = centroids.shape[0]
+    n_features = data.shape[1]
+    labels = np.zeros(n_samples, dtype=np.int32)
+    
+    for i in prange(n_samples):
+        min_dist = np.inf
+        best_cluster = 0
+        
+        for j in range(n_clusters):
+            dist = 0.0
+            for k in range(n_features):
+                diff = data[i, k] - centroids[j, k]
+                dist += diff * diff
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_cluster = j
+        
+        labels[i] = best_cluster
+    
+    return labels
+
+class GPUHyperOptimizedDataTransformer:
+    """GPU-accelerated hyper-optimized transformer using CuPy and cuML."""
+    
+    def __init__(self, n_jobs: int = None, use_gpu: bool = True):
         self.console = Console()
         self.n_jobs = n_jobs if n_jobs else mp.cpu_count()
-        self.scalers = {}
+        self.use_gpu = use_gpu and GPU_AVAILABLE
+        
+        # Initialize GPU memory manager
+        self.gpu_manager = GPUMemoryManager()
+        self.use_gpu = self.use_gpu and self.gpu_manager.gpu_available
+        
+        # Pre-initialize transformers based on GPU availability
+        if self.use_gpu:
+            self.scalers = {
+                'standard': CuStandardScaler(),
+                'minmax': CuMinMaxScaler()
+            }
+            self.pca_models = {}
+            self.svd_models = {}
+            self.kmeans_models = {}
+        else:
+            self.scalers = {
+                'standard': StandardScaler(),
+                'minmax': MinMaxScaler()
+            }
+            self.pca_models = {}
+            self.svd_models = {}
+            self.kmeans_models = {}
+        
         self.encoders = {}
         self.transformation_cache = {}
         
-        # Initialize swifter for pandas acceleration
+        # Pre-compile numba functions
+        self._precompile_numba()
+        
         pd.options.mode.chained_assignment = None
         
-        self.console.print(f"[green]✓ UltraFast Transformer initialized with {self.n_jobs} cores[/green]")
+        gpu_status = "GPU-ACCELERATED" if self.use_gpu else "CPU-ONLY"
+        self.console.print(f"[green]✓ {gpu_status} Hyper-Optimized Transformer initialized with {self.n_jobs} cores[/green]")
+        
+        if self.use_gpu:
+            free_mem, total_mem = cp.cuda.runtime.memGetInfo()
+            self.console.print(f"[blue]GPU Memory: {free_mem / 1024**3:.1f}GB free / {total_mem / 1024**3:.1f}GB total[/blue]")
     
-    def optimize_dtypes_ultra(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ultra-fast dtype optimization without memory constraints."""
-        # Use float32 instead of float64 for all floats
-        float_cols = df.select_dtypes(include=['float64']).columns
-        df[float_cols] = df[float_cols].astype(np.float32)
-        
-        # Use int32 for most integers (faster than smaller types on modern CPUs)
-        int_cols = df.select_dtypes(include=['int64']).columns
-        for col in int_cols:
-            if df[col].max() < 2147483647:
-                df[col] = df[col].astype(np.int32)
-        
-        # Don't use categories for IDs - keep as integers for faster operations
-        return df
+    def _precompile_numba(self):
+        """Pre-compile numba functions for faster first run."""
+        dummy_data = np.array([0], dtype=np.int32)
+        dummy_ratings = np.array([3.5], dtype=np.float32)
+        try:
+            ultra_fast_groupby_stats(dummy_data, dummy_ratings, dummy_data, dummy_data, 1)
+        except:
+            pass
     
-    def create_user_features_ultra_fast(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
-        """Ultra-fast user feature creation using vectorized operations and numba."""
-        self.console.print("[cyan]Creating user features (ULTRA-FAST mode)...[/cyan]")
+    def _to_gpu(self, data):
+        """Transfer data to GPU if available and beneficial."""
+        if not self.use_gpu:
+            return data
         
-        # Pre-compute mappings
+        if isinstance(data, pd.DataFrame):
+            if self.gpu_manager.can_fit_array(data.shape, cp.float32):
+                return cp.asarray(data.values, dtype=cp.float32)
+        elif isinstance(data, np.ndarray):
+            if self.gpu_manager.can_fit_array(data.shape, data.dtype):
+                return cp.asarray(data)
+        
+        return data
+    
+    def _to_cpu(self, data):
+        """Transfer data back to CPU."""
+        if hasattr(data, 'get'):  # CuPy array
+            return data.get()
+        return data
+    
+    def create_user_features_gpu_accelerated(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
+        """GPU-accelerated user feature creation."""
+        self.console.print("[cyan]Creating user features (GPU-ACCELERATED mode)...[/cyan]")
+        
+        # Convert to numpy arrays
         unique_users = ratings_df['userId'].unique()
         user_to_idx = {user: idx for idx, user in enumerate(unique_users)}
         
-        # Convert to numpy arrays for faster processing
-        user_indices = ratings_df['userId'].map(user_to_idx).values.astype(np.int32)
+        # Vectorized conversion to arrays
+        user_indices = np.fromiter((user_to_idx[uid] for uid in ratings_df['userId'].values), 
+                                   dtype=np.int32, count=len(ratings_df))
         ratings = ratings_df['rating'].values.astype(np.float32)
         movie_ids = ratings_df['movieId'].values.astype(np.int32)
-        timestamps = ratings_df['timestamp'].values
+        timestamps = ratings_df['timestamp'].astype(np.int64).values // 10**9
         
-        # Use numba-accelerated function for basic stats
-        user_stats = fast_groupby_stats(user_indices, ratings, movie_ids, len(unique_users))
+        # Use GPU-accelerated or CPU-optimized function
+        if self.use_gpu and len(ratings_df) > 100000:
+            self.console.print("[blue]Using GPU acceleration for groupby statistics...[/blue]")
+            counts, means, stds, mins, maxs, first_time, last_time, unique_counts = \
+                gpu_groupby_stats(user_indices, ratings, movie_ids, timestamps, len(unique_users))
+        else:
+            counts, means, stds, mins, maxs, first_time, last_time, unique_counts = \
+                ultra_fast_groupby_stats(user_indices, ratings, movie_ids, timestamps, len(unique_users))
         
-        # Create base features dataframe
-        user_features = pd.DataFrame(
-            user_stats[:, :3],
-            columns=['rating_count', 'rating_sum', 'rating_mean'],
-            index=unique_users
-        )
+        # Create DataFrame in one shot
+        user_features = pd.DataFrame({
+            'rating_count': counts,
+            'rating_mean': means,
+            'rating_std': stds,
+            'rating_min': mins,
+            'rating_max': maxs,
+            'movie_diversity': unique_counts,
+            'first_timestamp': first_time,
+            'last_timestamp': last_time
+        }, index=unique_users)
         
-        # Vectorized operations for additional features
-        user_groups = ratings_df.groupby('userId', sort=False)
-        
-        # Use parallel aggregation
-        with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
-            # Split into chunks for parallel processing
-            chunk_size = len(unique_users) // self.n_jobs
-            user_chunks = [unique_users[i:i+chunk_size] for i in range(0, len(unique_users), chunk_size)]
+        # GPU-accelerated vectorized operations if data fits in GPU memory
+        if self.use_gpu and self.gpu_manager.can_fit_array(user_features.shape):
+            self.console.print("[blue]Using GPU for derived feature calculations...[/blue]")
             
-            def process_user_chunk(users):
-                chunk_features = {}
-                for user in users:
-                    user_data = ratings_df[ratings_df['userId'] == user]
-                    if len(user_data) > 0:
-                        chunk_features[user] = {
-                            'rating_std': user_data['rating'].std(),
-                            'rating_min': user_data['rating'].min(),
-                            'rating_max': user_data['rating'].max(),
-                            'movie_diversity': user_data['movieId'].nunique(),
-                            'time_span': (user_data['timestamp'].max() - user_data['timestamp'].min()).total_seconds() / 86400
-                        }
-                return chunk_features
+            # Transfer to GPU
+            first_time_gpu = cp.asarray(first_time)
+            last_time_gpu = cp.asarray(last_time)
+            rating_max_gpu = cp.asarray(maxs)
+            rating_min_gpu = cp.asarray(mins)
+            rating_count_gpu = cp.asarray(counts)
+            unique_counts_gpu = cp.asarray(unique_counts)
             
-            # Process chunks in parallel
-            futures = [executor.submit(process_user_chunk, chunk) for chunk in user_chunks]
+            # GPU calculations
+            time_span_days = (last_time_gpu - first_time_gpu) / 86400
+            rating_range = rating_max_gpu - rating_min_gpu
+            rating_frequency = rating_count_gpu / (time_span_days + 1)
             
-            # Combine results
-            all_features = {}
-            for future in futures:
-                all_features.update(future.result())
+            # Quantile calculations on GPU
+            q75_count = cp.percentile(rating_count_gpu, 75)
+            q75_diversity = cp.percentile(unique_counts_gpu, 75)
+            
+            is_active = (rating_count_gpu > q75_count).astype(cp.int8)
+            is_diverse = (unique_counts_gpu > q75_diversity).astype(cp.int8)
+            
+            # Transfer results back to CPU
+            user_features['time_span_days'] = cp.asnumpy(time_span_days)
+            user_features['rating_range'] = cp.asnumpy(rating_range)
+            user_features['rating_frequency'] = cp.asnumpy(rating_frequency)
+            user_features['is_active'] = cp.asnumpy(is_active)
+            user_features['is_diverse'] = cp.asnumpy(is_diverse)
+            
+            # Clear GPU memory
+            self.gpu_manager.clear_cache()
+        else:
+            # CPU fallback
+            user_features['time_span_days'] = (user_features['last_timestamp'] - user_features['first_timestamp']) / 86400
+            user_features['rating_range'] = user_features['rating_max'] - user_features['rating_min']
+            user_features['rating_frequency'] = user_features['rating_count'] / (user_features['time_span_days'] + 1)
+            
+            q75_count = np.percentile(counts, 75)
+            q75_diversity = np.percentile(unique_counts, 75)
+            
+            user_features['is_active'] = (user_features['rating_count'] > q75_count).astype(np.int8)
+            user_features['is_diverse'] = (user_features['movie_diversity'] > q75_diversity).astype(np.int8)
         
-        # Convert to DataFrame
-        extra_features = pd.DataFrame.from_dict(all_features, orient='index')
-        user_features = user_features.join(extra_features)
+        # Drop temporary columns
+        user_features = user_features.drop(['first_timestamp', 'last_timestamp'], axis=1)
         
-        # Fill NaN values with 0
-        user_features = user_features.fillna(0)
+        # Optimize dtypes
+        float_cols = user_features.select_dtypes(include=['float64']).columns
+        user_features[float_cols] = user_features[float_cols].astype(np.float32)
         
-        # Add derived features using vectorized operations
-        user_features['rating_range'] = user_features['rating_max'] - user_features['rating_min']
-        user_features['rating_frequency'] = user_features['rating_count'] / (user_features['time_span'] + 1)
-        user_features['is_active'] = (user_features['rating_count'] > user_features['rating_count'].quantile(0.75)).astype(np.int8)
-        user_features['is_diverse'] = (user_features['movie_diversity'] > user_features['movie_diversity'].quantile(0.75)).astype(np.int8)
+        gc.collect()
         
-        # Convert to optimal dtypes
-        user_features = self.optimize_dtypes_ultra(user_features)
-        
-        self.console.print(f"[green]✓ Created {len(user_features.columns)} user features in ULTRA-FAST mode[/green]")
+        self.console.print(f"[green]✓ Created {len(user_features.columns)} user features with GPU acceleration[/green]")
         return user_features
     
-    def create_movie_features_ultra_fast(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> pd.DataFrame:
-        """Ultra-fast movie feature creation."""
-        self.console.print("[cyan]Creating movie features (ULTRA-FAST mode)...[/cyan]")
+    def create_movie_features_gpu_accelerated(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> pd.DataFrame:
+        """GPU-accelerated movie feature creation."""
+        self.console.print("[cyan]Creating movie features (GPU-ACCELERATED mode)...[/cyan]")
         
-        # Use swifter for faster pandas operations
-        movie_stats = ratings_df.swifter.groupby('movieId').agg({
-            'rating': ['count', 'mean', 'std', 'min', 'max'],
-            'userId': 'nunique',
-            'timestamp': ['min', 'max']
-        })
+        # Use GPU for large datasets
+        if self.use_gpu and len(ratings_df) > 50000:
+            self.console.print("[blue]Using GPU for movie statistics computation...[/blue]")
+            
+            # Transfer to GPU
+            movie_ids = cp.asarray(ratings_df['movieId'].values)
+            ratings = cp.asarray(ratings_df['rating'].values)
+            user_ids = cp.asarray(ratings_df['userId'].values)
+            
+            unique_movies = cp.unique(movie_ids)
+            n_movies = len(unique_movies)
+            
+            # GPU-based aggregation using advanced indexing
+            movie_counts = cp.zeros(n_movies, dtype=cp.int32)
+            movie_sums = cp.zeros(n_movies, dtype=cp.float32)
+            movie_sum_squares = cp.zeros(n_movies, dtype=cp.float32)
+            
+            # Create mapping for GPU operations
+            movie_to_idx = cp.arange(len(unique_movies))
+            movie_idx_map = cp.zeros(movie_ids.max() + 1, dtype=cp.int32) - 1
+            movie_idx_map[unique_movies] = movie_to_idx
+            
+            # Map movie IDs to indices
+            movie_indices = movie_idx_map[movie_ids]
+            valid_mask = movie_indices >= 0
+            
+            # GPU aggregation
+            cp.add.at(movie_counts, movie_indices[valid_mask], 1)
+            cp.add.at(movie_sums, movie_indices[valid_mask], ratings[valid_mask])
+            cp.add.at(movie_sum_squares, movie_indices[valid_mask], ratings[valid_mask]**2)
+            
+            # Calculate statistics on GPU
+            movie_means = movie_sums / cp.maximum(movie_counts, 1)
+            movie_vars = (movie_sum_squares / cp.maximum(movie_counts, 1)) - movie_means**2
+            movie_stds = cp.sqrt(cp.maximum(movie_vars, 0))
+            
+            # Calculate user diversity on GPU
+            user_diversity = cp.zeros(n_movies, dtype=cp.int32)
+            for i in range(n_movies):
+                mask = movie_indices == i
+                if mask.any():
+                    user_diversity[i] = len(cp.unique(user_ids[mask]))
+            
+            # Transfer back to CPU
+            movie_features = pd.DataFrame({
+                'rating_count': cp.asnumpy(movie_counts),
+                'rating_mean': cp.asnumpy(movie_means),
+                'rating_std': cp.asnumpy(movie_stds),
+                'user_diversity': cp.asnumpy(user_diversity)
+            }, index=cp.asnumpy(unique_movies))
+            
+            # Clear GPU memory
+            self.gpu_manager.clear_cache()
+            
+        else:
+            # CPU fallback for smaller datasets
+            unique_movies = ratings_df['movieId'].unique()
+            movie_to_idx = {movie: idx for idx, movie in enumerate(unique_movies)}
+            
+            n_movies = len(unique_movies)
+            movie_counts = np.zeros(n_movies, dtype=np.int32)
+            movie_sums = np.zeros(n_movies, dtype=np.float32)
+            movie_sum_squares = np.zeros(n_movies, dtype=np.float32)
+            movie_user_sets = [set() for _ in range(n_movies)]
+            
+            # Single pass through data
+            for _, row in ratings_df.iterrows():
+                idx = movie_to_idx[row['movieId']]
+                rating = row['rating']
+                movie_counts[idx] += 1
+                movie_sums[idx] += rating
+                movie_sum_squares[idx] += rating * rating
+                movie_user_sets[idx].add(row['userId'])
+            
+            # Calculate statistics
+            movie_means = movie_sums / np.maximum(movie_counts, 1)
+            movie_vars = (movie_sum_squares / np.maximum(movie_counts, 1)) - movie_means**2
+            movie_stds = np.sqrt(np.maximum(movie_vars, 0))
+            user_diversity = np.array([len(s) for s in movie_user_sets])
+            
+            movie_features = pd.DataFrame({
+                'rating_count': movie_counts,
+                'rating_mean': movie_means,
+                'rating_std': movie_stds,
+                'user_diversity': user_diversity
+            }, index=unique_movies)
         
-        movie_stats.columns = ['rating_count', 'rating_mean', 'rating_std', 
-                              'rating_min', 'rating_max', 'user_diversity',
-                              'first_rating', 'last_rating']
+        # Merge with movie metadata
+        movie_features = movie_features.join(movies_df.set_index('movieId'), how='left')
         
-        # Join with movie metadata
-        movie_features = movie_stats.join(movies_df.set_index('movieId'), how='left')
-        
-        # Vectorized genre processing
+        # GPU-accelerated genre encoding using hashing
         if 'genre_list' in movie_features.columns:
-            # Create genre matrix using MultiLabelBinarizer (faster than manual)
-            mlb = MultiLabelBinarizer(sparse_output=True)
-            genre_matrix = mlb.fit_transform(movie_features['genre_list'].fillna(''))
+            n_genres = 50
             
-            # Convert to DataFrame (keep sparse for memory efficiency)
-            genre_df = pd.DataFrame.sparse.from_spmatrix(
-                genre_matrix,
-                index=movie_features.index,
-                columns=[f'genre_{g}'.lower().replace(' ', '_') for g in mlb.classes_]
-            )
-            
-            movie_features = pd.concat([movie_features, genre_df], axis=1)
-            movie_features['genre_count'] = genre_matrix.sum(axis=1).A1
+            if self.use_gpu and len(movie_features) > 10000:
+                self.console.print("[blue]Using GPU for genre encoding...[/blue]")
+                
+                # GPU-based hashing
+                genre_matrix = cp.zeros((len(movie_features), n_genres), dtype=cp.float32)
+                
+                for idx, genres in enumerate(movie_features['genre_list'].fillna('')):
+                    if isinstance(genres, list):
+                        for genre in genres:
+                            hash_idx = murmurhash3_32(genre, positive=True) % n_genres
+                            genre_matrix[idx, hash_idx] = 1
+                
+                # Add genre features
+                genre_df = pd.DataFrame(
+                    cp.asnumpy(genre_matrix),
+                    columns=[f'genre_hash_{i}' for i in range(n_genres)],
+                    index=movie_features.index
+                )
+                movie_features = pd.concat([movie_features, genre_df], axis=1)
+                movie_features['genre_count'] = cp.asnumpy(genre_matrix.sum(axis=1))
+                
+                self.gpu_manager.clear_cache()
+            else:
+                # CPU fallback
+                genre_matrix = np.zeros((len(movie_features), n_genres), dtype=np.float32)
+                
+                for idx, genres in enumerate(movie_features['genre_list'].fillna('')):
+                    if isinstance(genres, list):
+                        for genre in genres:
+                            hash_idx = murmurhash3_32(genre, positive=True) % n_genres
+                            genre_matrix[idx, hash_idx] = 1
+                
+                genre_df = pd.DataFrame(
+                    genre_matrix,
+                    columns=[f'genre_hash_{i}' for i in range(n_genres)],
+                    index=movie_features.index
+                )
+                movie_features = pd.concat([movie_features, genre_df], axis=1)
+                movie_features['genre_count'] = genre_matrix.sum(axis=1)
         
-        # Fast popularity calculation
+        # Vectorized derived features
         movie_features['popularity_score'] = movie_features['rating_count'] * movie_features['rating_mean']
-        movie_features['rating_velocity'] = movie_features['rating_count'] / (
-            (movie_features['last_rating'] - movie_features['first_rating']).dt.total_seconds() / 86400 + 1
-        )
-        
-        # Binary features
         movie_features['is_popular'] = (movie_features['rating_count'] > movie_features['rating_count'].quantile(0.8)).astype(np.int8)
         movie_features['is_acclaimed'] = (movie_features['rating_mean'] > 4.0).astype(np.int8)
         
         # Movie age
-        current_year = pd.Timestamp.now().year
+        current_year = 2025
         movie_features['movie_age'] = current_year - movie_features['year'].fillna(current_year)
         
-        movie_features = self.optimize_dtypes_ultra(movie_features.fillna(0))
+        # Optimize dtypes
+        movie_features = movie_features.fillna(0)
+        for col in movie_features.select_dtypes(include=['float64']).columns:
+            movie_features[col] = movie_features[col].astype(np.float32)
         
-        self.console.print(f"[green]✓ Created {len(movie_features.columns)} movie features in ULTRA-FAST mode[/green]")
+        gc.collect()
+        
+        self.console.print(f"[green]✓ Created {len(movie_features.columns)} movie features with GPU acceleration[/green]")
         return movie_features
     
-    def create_temporal_features_vectorized(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
-        """Vectorized temporal feature creation."""
-        self.console.print("[cyan]Creating temporal features (vectorized)...[/cyan]")
-        
-        temp_df = ratings_df.copy()
-        
-        # Vectorized datetime operations
-        temp_df['hour'] = temp_df['timestamp'].dt.hour
-        temp_df['day_of_week'] = temp_df['timestamp'].dt.dayofweek
-        temp_df['month'] = temp_df['timestamp'].dt.month
-        temp_df['year'] = temp_df['timestamp'].dt.year
-        temp_df['day_of_year'] = temp_df['timestamp'].dt.dayofyear
-        
-        # Vectorized season calculation
-        temp_df['season'] = (temp_df['month'] % 12 + 3) // 3
-        
-        # Weekend flag
-        temp_df['is_weekend'] = (temp_df['day_of_week'] >= 5).astype(np.int8)
-        
-        # Time of day categories
-        temp_df['time_of_day'] = pd.cut(
-            temp_df['hour'],
-            bins=[-1, 6, 12, 18, 24],
-            labels=['night', 'morning', 'afternoon', 'evening']
-        )
-        
-        return temp_df
-    
-    def create_interaction_features_parallel(self, df: pd.DataFrame, user_features: pd.DataFrame, 
-                                           movie_features: pd.DataFrame) -> pd.DataFrame:
-        """Create interaction features using parallel processing."""
-        self.console.print("[cyan]Creating interaction features (parallel)...[/cyan]")
-        
-        # Merge features efficiently
-        df = df.merge(user_features[['rating_mean', 'rating_count']], 
-                     left_on='userId', right_index=True, suffixes=('', '_user'))
-        df = df.merge(movie_features[['rating_mean', 'rating_count']], 
-                     left_on='movieId', right_index=True, suffixes=('', '_movie'))
-        
-        # Vectorized interaction features
-        df['user_movie_rating_diff'] = df['rating_mean_user'] - df['rating_mean_movie']
-        df['user_movie_count_ratio'] = df['rating_count_user'] / (df['rating_count_movie'] + 1)
-        df['rating_vs_user_mean'] = df['rating'] - df['rating_mean_user']
-        df['rating_vs_movie_mean'] = df['rating'] - df['rating_mean_movie']
-        
-        return df
-    
-    def create_sparse_features_ultra_fast(self, tags_df: pd.DataFrame, movies_df: pd.DataFrame,
-                                         max_features: int = 200) -> Tuple[csr_matrix, np.ndarray, TfidfVectorizer]:
-        """Ultra-fast sparse feature creation."""
-        self.console.print("[cyan]Creating sparse TF-IDF features (ultra-fast)...[/cyan]")
-        
-        # Aggregate tags per movie
-        movie_tags = tags_df.groupby('movieId')['tag_clean'].apply(' '.join).reset_index()
-        
-        # Ensure all movies are included
-        all_movies = movies_df[['movieId']].copy()
-        movie_tags = all_movies.merge(movie_tags, on='movieId', how='left')
-        movie_tags['tag_clean'] = movie_tags['tag_clean'].fillna('')
-        
-        # Use HashingVectorizer for speed (no vocabulary needed)
-        from sklearn.feature_extraction.text import HashingVectorizer
-        
-        vectorizer = HashingVectorizer(
-            n_features=max_features,
-            ngram_range=(1, 2),
-            dtype=np.float32,
-            norm='l2'
-        )
-        
-        # Process in parallel chunks
-        chunk_size = len(movie_tags) // self.n_jobs
-        chunks = [movie_tags['tag_clean'].iloc[i:i+chunk_size] for i in range(0, len(movie_tags), chunk_size)]
-        
-        with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
-            sparse_chunks = list(executor.map(vectorizer.transform, chunks))
-        
-        # Combine chunks
-        tfidf_matrix = sparse.vstack(sparse_chunks)
-        
-        self.console.print(f"[green]✓ Created {tfidf_matrix.shape} sparse matrix[/green]")
-        return tfidf_matrix, movie_tags['movieId'].values, vectorizer
-    
-    def create_user_item_matrix_fast(self, ratings_df: pd.DataFrame) -> Tuple[csr_matrix, Dict, Dict]:
-        """Ultra-fast user-item matrix creation."""
-        self.console.print("[cyan]Creating user-item matrix (optimized)...[/cyan]")
-        
-        # Get unique users and movies
-        users = ratings_df['userId'].unique()
-        movies = ratings_df['movieId'].unique()
-        
-        # Create mappings
-        user_to_idx = {user: idx for idx, user in enumerate(users)}
-        movie_to_idx = {movie: idx for idx, movie in enumerate(movies)}
-        
-        # Create COO matrix (fastest for construction)
-        row_ind = ratings_df['userId'].map(user_to_idx).values
-        col_ind = ratings_df['movieId'].map(movie_to_idx).values
-        data = ratings_df['rating'].values.astype(np.float32)
-        
-        matrix = coo_matrix((data, (row_ind, col_ind)), 
-                           shape=(len(users), len(movies)), 
-                           dtype=np.float32)
-        
-        # Convert to CSR for efficient operations
-        matrix = matrix.tocsr()
-        
-        self.console.print(f"[green]✓ Created {matrix.shape} sparse matrix (density: {matrix.nnz / matrix.shape[0] / matrix.shape[1]:.4f})[/green]")
-        
-        return matrix, user_to_idx, movie_to_idx
-    
-    @lru_cache(maxsize=128)
-    def _cached_computation(self, key: str, *args):
-        """Cache expensive computations."""
-        return self.transformation_cache.get(key, None)
-    
-    def parallel_transform_batches(self, df: pd.DataFrame, transform_func, batch_size: int = 500000):
-        """Transform data in parallel batches."""
-        n_batches = (len(df) + batch_size - 1) // batch_size
-        
-        def process_batch(i):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, len(df))
-            return transform_func(df.iloc[start_idx:end_idx])
-        
-        with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
-            results = list(executor.map(process_batch, range(n_batches)))
-        
-        return pd.concat(results, ignore_index=True)
-    
-    def create_cold_start_features_ultra_fast(self, ratings_df: pd.DataFrame, user_features: pd.DataFrame,
-                                             movie_features: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Ultra-fast cold start feature creation."""
-        self.console.print("[cyan]Creating cold start features (ultra-fast)...[/cyan]")
+    def create_cold_start_features_gpu_accelerated(self, ratings_df: pd.DataFrame, 
+                                                  user_features: pd.DataFrame,
+                                                  movie_features: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """GPU-accelerated cold start feature creation."""
+        self.console.print("[cyan]Creating cold start features (GPU-ACCELERATED)...[/cyan]")
         
         # User cold start features
         user_cold_features = pd.DataFrame(index=user_features.index)
         
-        # Vectorized operations
-        cold_threshold = user_features['rating_count'].quantile(0.1)
-        user_cold_features['is_cold_start'] = (user_features['rating_count'] < cold_threshold).astype(np.int8)
-        user_cold_features['rating_confidence'] = 1 - np.exp(-user_features['rating_count'] / 10)
-        
-        # Fast clustering using MiniBatchKMeans
-        n_clusters = min(50, len(user_features) // 1000)
-        numeric_cols = user_features.select_dtypes(include=[np.number]).columns
-        
-        if len(numeric_cols) > 3:
-            # Use only most important features for clustering
-            cluster_features = user_features[['rating_count', 'rating_mean', 'rating_std']].fillna(0)
+        if self.use_gpu and len(user_features) > 1000:
+            self.console.print("[blue]Using GPU for cold start feature computation...[/blue]")
             
-            kmeans = MiniBatchKMeans(
-                n_clusters=n_clusters,
-                batch_size=10000,
-                random_state=42,
-                n_init=3,
-                max_iter=50
-            )
-            user_cold_features['user_cluster'] = kmeans.fit_predict(cluster_features)
+            # Transfer to GPU
+            rating_counts_gpu = cp.asarray(user_features['rating_count'].values)
             
-            # Fast cluster statistics
-            cluster_means = ratings_df.groupby(
-                ratings_df['userId'].map(dict(zip(user_features.index, user_cold_features['user_cluster'])))
-            )['rating'].mean()
-            user_cold_features['cluster_avg_rating'] = user_cold_features['user_cluster'].map(cluster_means).fillna(3.5)
+            # GPU-based cold start detection
+            cold_threshold = cp.percentile(rating_counts_gpu, 10)
+            is_cold_start = (rating_counts_gpu < cold_threshold).astype(cp.int8)
+            rating_confidence = 1 - cp.exp(-rating_counts_gpu / 10)
+            
+            # Transfer back to CPU
+            user_cold_features['is_cold_start'] = cp.asnumpy(is_cold_start)
+            user_cold_features['rating_confidence'] = cp.asnumpy(rating_confidence)
+            
+        else:
+            # CPU fallback
+            cold_threshold = np.percentile(user_features['rating_count'].values, 10)
+            user_cold_features['is_cold_start'] = (user_features['rating_count'] < cold_threshold).astype(np.int8)
+            user_cold_features['rating_confidence'] = 1 - np.exp(-user_features['rating_count'].values / 10)
         
-        # Movie cold start features
+        # GPU-accelerated clustering
+        if len(user_features) > 1000:
+            key_features = ['rating_count', 'rating_mean', 'rating_std', 'movie_diversity']
+            X_user = user_features[key_features].fillna(0).values
+            
+            if self.use_gpu and self.gpu_manager.can_fit_array(X_user.shape):
+                self.console.print("[blue]Using cuML for user clustering...[/blue]")
+                
+                # GPU-based preprocessing and clustering
+                scaler = CuStandardScaler()
+                X_user_gpu = cp.asarray(X_user, dtype=cp.float32)
+                X_user_scaled = scaler.fit_transform(X_user_gpu)
+                
+                # GPU SVD
+                n_components = min(10, X_user_scaled.shape[1])
+                svd = CuTruncatedSVD(n_components=n_components, random_state=42)
+                X_user_reduced = svd.fit_transform(X_user_scaled)
+                
+                # GPU K-means
+                n_clusters = min(20, len(user_features) // 500)
+                kmeans = CuKMeans(
+                    n_clusters=n_clusters,
+                    max_iter=10,
+                    random_state=42
+                )
+                
+                user_clusters = kmeans.fit_predict(X_user_reduced)
+                user_cold_features['user_cluster'] = cp.asnumpy(user_clusters)
+                
+                # GPU-based cluster statistics
+                n_clusters_actual = len(cp.unique(user_clusters))
+                cluster_ratings = cp.zeros(n_clusters_actual)
+                cluster_counts = cp.zeros(n_clusters_actual)
+                
+                # Vectorized aggregation on GPU
+                ratings_gpu = cp.asarray(ratings_df['rating'].values)
+                user_ids_gpu = cp.asarray(ratings_df['userId'].values)
+                
+                for cluster_id in range(n_clusters_actual):
+                    cluster_mask = user_clusters == cluster_id
+                    cluster_users = cp.asarray(user_features.index[cp.asnumpy(cluster_mask)])
+                    
+                    if len(cluster_users) > 0:
+                        user_mask = cp.isin(user_ids_gpu, cluster_users)
+                        if user_mask.any():
+                            cluster_ratings[cluster_id] = ratings_gpu[user_mask].sum()
+                            cluster_counts[cluster_id] = user_mask.sum()
+                
+                cluster_means = cluster_ratings / cp.maximum(cluster_counts, 1)
+                user_cold_features['cluster_avg_rating'] = user_cold_features['user_cluster'].map(
+                    dict(enumerate(cp.asnumpy(cluster_means)))
+                ).fillna(3.5)
+                
+                self.gpu_manager.clear_cache()
+                
+            else:
+                # CPU fallback clustering
+                X_user_scaled = (X_user - X_user.mean(axis=0)) / (X_user.std(axis=0) + 1e-8)
+                
+                n_components = min(10, X_user_scaled.shape[1])
+                svd = TruncatedSVD(n_components=n_components, random_state=42)
+                X_user_reduced = svd.fit_transform(X_user_scaled)
+                
+                n_clusters = min(20, len(user_features) // 500)
+                kmeans = MiniBatchKMeans(
+                    n_clusters=n_clusters,
+                    batch_size=min(20000, len(user_features)),
+                    max_iter=10,
+                    n_init=1,
+                    random_state=42,
+                    reassignment_ratio=0.001
+                )
+                
+                user_cold_features['user_cluster'] = kmeans.fit_predict(X_user_reduced)
+                
+                # Cluster statistics
+                cluster_ratings = np.zeros(n_clusters)
+                cluster_counts = np.zeros(n_clusters)
+                
+                user_cluster_map = dict(zip(user_features.index, user_cold_features['user_cluster']))
+                
+                for user_id, cluster in user_cluster_map.items():
+                    user_mask = ratings_df['userId'] == user_id
+                    if user_mask.any():
+                        cluster_ratings[cluster] += ratings_df.loc[user_mask, 'rating'].sum()
+                        cluster_counts[cluster] += user_mask.sum()
+                
+                cluster_means = cluster_ratings / np.maximum(cluster_counts, 1)
+                user_cold_features['cluster_avg_rating'] = user_cold_features['user_cluster'].map(
+                    dict(enumerate(cluster_means))
+                ).fillna(3.5)
+        
+        # Movie cold start features (similar GPU acceleration)
         movie_cold_features = pd.DataFrame(index=movie_features.index)
         
-        movie_cold_threshold = movie_features['rating_count'].quantile(0.1)
-        movie_cold_features['is_cold_start'] = (movie_features['rating_count'] < movie_cold_threshold).astype(np.int8)
-        movie_cold_features['rating_confidence'] = 1 - np.exp(-movie_features['rating_count'] / 10)
+        if self.use_gpu and len(movie_features) > 1000:
+            rating_counts_gpu = cp.asarray(movie_features['rating_count'].values)
+            movie_cold_threshold = cp.percentile(rating_counts_gpu, 10)
+            movie_cold_features['is_cold_start'] = cp.asnumpy((rating_counts_gpu < movie_cold_threshold).astype(cp.int8))
+            movie_cold_features['rating_confidence'] = cp.asnumpy(1 - cp.exp(-rating_counts_gpu / 10))
+        else:
+            movie_cold_threshold = np.percentile(movie_features['rating_count'].values, 10)
+            movie_cold_features['is_cold_start'] = (movie_features['rating_count'] < movie_cold_threshold).astype(np.int8)
+            movie_cold_features['rating_confidence'] = 1 - np.exp(-movie_features['rating_count'].values / 10)
         
-        # Fast movie clustering
-        if len(movie_features) > 100:
-            genre_cols = [col for col in movie_features.columns if col.startswith('genre_')]
-            if len(genre_cols) > 5:
-                # Use binary genre features for clustering
-                movie_cluster_features = movie_features[genre_cols[:20]].fillna(0)
+        # GPU-accelerated movie clustering using genre features
+        if len(movie_features) > 1000:
+            genre_cols = [col for col in movie_features.columns if col.startswith('genre_hash_')]
+            if len(genre_cols) >= 5:
+                X_movie = movie_features[genre_cols[:20]].values
                 
-                movie_kmeans = MiniBatchKMeans(
-                    n_clusters=min(100, len(movie_features) // 500),
-                    batch_size=5000,
-                    random_state=42,
-                    n_init=3,
-                    max_iter=50
-                )
-                movie_cold_features['movie_cluster'] = movie_kmeans.fit_predict(movie_cluster_features)
+                if self.use_gpu and self.gpu_manager.can_fit_array(X_movie.shape):
+                    self.console.print("[blue]Using cuML for movie clustering...[/blue]")
+                    
+                    X_movie_gpu = cp.asarray(X_movie, dtype=cp.float32)
+                    n_clusters = min(50, len(movie_features) // 200)
+                    
+                    movie_kmeans = CuKMeans(
+                        n_clusters=n_clusters,
+                        max_iter=10,
+                        random_state=42
+                    )
+                    
+                    movie_clusters = movie_kmeans.fit_predict(X_movie_gpu)
+                    movie_cold_features['movie_cluster'] = cp.asnumpy(movie_clusters)
+                    
+                    self.gpu_manager.clear_cache()
+                else:
+                    # CPU fallback
+                    n_clusters = min(50, len(movie_features) // 200)
+                    movie_kmeans = MiniBatchKMeans(
+                        n_clusters=n_clusters,
+                        batch_size=min(10000, len(movie_features)),
+                        max_iter=10,
+                        n_init=1,
+                        random_state=42
+                    )
+                    
+                    movie_cold_features['movie_cluster'] = movie_kmeans.fit_predict(X_movie)
         
-        # Global average
-        global_avg = ratings_df['rating'].mean()
+        # Global averages
+        global_avg = np.float32(3.5)
         user_cold_features['global_avg_rating'] = global_avg
         movie_cold_features['global_avg_rating'] = global_avg
         
+        gc.collect()
+        
         return user_cold_features, movie_cold_features
     
-    def create_enhanced_genre_features_ultra_fast(self, movies_df: pd.DataFrame, ratings_df: pd.DataFrame) -> pd.DataFrame:
-        """Ultra-fast genre feature creation using vectorized operations."""
-        self.console.print("[cyan]Creating enhanced genre features (ultra-fast)...[/cyan]")
+    def create_all_features_pipeline_gpu(self, ratings_df: pd.DataFrame, 
+                                        movies_df: pd.DataFrame, 
+                                        tags_df: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
+        """Complete GPU-accelerated feature engineering pipeline."""
+        gpu_status = "GPU-ACCELERATED" if self.use_gpu else "CPU-OPTIMIZED"
+        self.console.print(f"\n[bold green]Starting {gpu_status} Feature Engineering Pipeline[/bold green]")
         
-        # Binary genre encoding using sparse matrix
-        mlb = MultiLabelBinarizer(sparse_output=True)
-        genre_matrix = mlb.fit_transform(movies_df['genre_list'].fillna(''))
+        if self.use_gpu:
+            free_mem, total_mem = cp.cuda.runtime.memGetInfo()
+            self.console.print(f"[blue]GPU Memory Available: {free_mem / 1024**3:.1f}GB / {total_mem / 1024**3:.1f}GB[/blue]")
         
-        # Convert to sparse DataFrame
-        genre_df = pd.DataFrame.sparse.from_spmatrix(
-            genre_matrix,
-            index=movies_df['movieId'],
-            columns=[f'genre_{g}'.lower().replace(' ', '_') for g in mlb.classes_]
-        )
-        
-        # Basic genre statistics
-        genre_stats = pd.DataFrame(index=movies_df['movieId'])
-        genre_stats['genre_count'] = genre_matrix.sum(axis=1).A1
-        genre_stats['is_single_genre'] = (genre_stats['genre_count'] == 1).astype(np.int8)
-        genre_stats['is_multi_genre'] = (genre_stats['genre_count'] > 1).astype(np.int8)
-        
-        # Fast genre performance using groupby
-        movie_stats = ratings_df.groupby('movieId').agg({
-            'rating': ['mean', 'count', 'std']
-        }).fillna(0)
-        movie_stats.columns = ['avg_rating', 'num_ratings', 'rating_std']
-        
-        # Combine features
-        genre_features = pd.concat([genre_df, genre_stats], axis=1)
-        
-        return genre_features
-    
-    def create_all_features_pipeline(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame, 
-                                   tags_df: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
-        """Complete feature engineering pipeline optimized for speed."""
-        self.console.print("\n[bold green]Starting ULTRA-FAST Feature Engineering Pipeline[/bold green]")
+        # Pre-allocate memory and optimize data types upfront
+        ratings_df['userId'] = ratings_df['userId'].astype(np.int32)
+        ratings_df['movieId'] = ratings_df['movieId'].astype(np.int32)
+        ratings_df['rating'] = ratings_df['rating'].astype(np.float32)
         
         with Progress(
             SpinnerColumn(),
@@ -439,68 +744,132 @@ class UltraFastDataTransformer:
             TimeElapsedColumn(),
             console=self.console
         ) as progress:
-            task = progress.add_task("[cyan]Feature Engineering...", total=8)
+            task = progress.add_task(f"[cyan]{gpu_status} Processing...", total=6)
             
-            # 1. Optimize dtypes
-            progress.update(task, description="[cyan]Optimizing data types...")
-            ratings_df = self.optimize_dtypes_ultra(ratings_df)
-            movies_df = self.optimize_dtypes_ultra(movies_df)
+            # 1. Temporal features (vectorized)
+            progress.update(task, description="[cyan]Temporal features...")
+            ratings_df['hour'] = ratings_df['timestamp'].dt.hour.astype(np.int8)
+            ratings_df['day_of_week'] = ratings_df['timestamp'].dt.dayofweek.astype(np.int8)
+            ratings_df['is_weekend'] = (ratings_df['day_of_week'] >= 5).astype(np.int8)
             progress.advance(task)
             
-            # 2. Create temporal features
-            progress.update(task, description="[cyan]Creating temporal features...")
-            ratings_df = self.create_temporal_features_vectorized(ratings_df)
+            # 2. User features (GPU-accelerated)
+            progress.update(task, description="[cyan]GPU User features...")
+            user_features = self.create_user_features_gpu_accelerated(ratings_df)
             progress.advance(task)
             
-            # 3. Create user features (parallel)
-            progress.update(task, description="[cyan]Creating user features...")
-            user_features = self.create_user_features_ultra_fast(ratings_df)
+            # 3. Movie features (GPU-accelerated)
+            progress.update(task, description="[cyan]GPU Movie features...")
+            movie_features = self.create_movie_features_gpu_accelerated(ratings_df, movies_df)
             progress.advance(task)
             
-            # 4. Create movie features (parallel)
-            progress.update(task, description="[cyan]Creating movie features...")
-            movie_features = self.create_movie_features_ultra_fast(ratings_df, movies_df)
-            progress.advance(task)
-            
-            # 5. Create genre features
-            progress.update(task, description="[cyan]Creating genre features...")
-            genre_features = self.create_enhanced_genre_features_ultra_fast(movies_df, ratings_df)
-            movie_features = pd.concat([movie_features, genre_features], axis=1)
-            progress.advance(task)
-            
-            # 6. Create cold start features
-            progress.update(task, description="[cyan]Creating cold start features...")
-            user_cold, movie_cold = self.create_cold_start_features_ultra_fast(
+            # 4. Cold start features (GPU-accelerated)
+            progress.update(task, description="[cyan]GPU Cold start features...")
+            user_cold, movie_cold = self.create_cold_start_features_gpu_accelerated(
                 ratings_df, user_features, movie_features
             )
             user_features = pd.concat([user_features, user_cold], axis=1)
             movie_features = pd.concat([movie_features, movie_cold], axis=1)
             progress.advance(task)
             
-            # 7. Create interaction features
-            progress.update(task, description="[cyan]Creating interaction features...")
-            ratings_enhanced = self.create_interaction_features_parallel(
-                ratings_df, user_features, movie_features
-            )
+            # 5. Sparse matrix creation (GPU-accelerated)
+            progress.update(task, description="[cyan]GPU Sparse matrices...")
+            user_item_matrix, user_mapping, movie_mapping = self.create_user_item_matrix_gpu_accelerated(ratings_df)
             progress.advance(task)
             
-            # 8. Create sparse features if tags available
-            sparse_features = None
-            if tags_df is not None and len(tags_df) > 0:
-                progress.update(task, description="[cyan]Creating sparse features...")
-                sparse_matrix, movie_ids, vectorizer = self.create_sparse_features_ultra_fast(
-                    tags_df, movies_df
-                )
-                sparse_features = {
-                    'matrix': sparse_matrix,
-                    'movie_ids': movie_ids,
-                    'vectorizer': vectorizer
-                }
+            # 6. Final optimization
+            progress.update(task, description="[cyan]Final optimization...")
+            # Convert all float64 to float32
+            for df in [user_features, movie_features]:
+                float_cols = df.select_dtypes(include=['float64']).columns
+                df[float_cols] = df[float_cols].astype(np.float32)
+            
+            if self.use_gpu:
+                self.gpu_manager.clear_cache()
+            gc.collect()
             progress.advance(task)
+        
+        # Enhanced ratings dataframe with all temporal features
+        ratings_enhanced = ratings_df.copy()
         
         return {
             'ratings_enhanced': ratings_enhanced,
             'user_features': user_features,
             'movie_features': movie_features,
-            'sparse_features': sparse_features
+            'user_item_matrix': user_item_matrix,
+            'user_mapping': user_mapping,
+            'movie_mapping': movie_mapping
         }
+    
+    def create_user_item_matrix_gpu_accelerated(self, ratings_df: pd.DataFrame) -> Tuple[csr_matrix, Dict, Dict]:
+        """GPU-accelerated user-item matrix creation using optimized sparse operations."""
+        
+        if self.use_gpu and len(ratings_df) > 100000:
+            self.console.print("[blue]Using GPU for sparse matrix creation...[/blue]")
+            
+            # Transfer to GPU
+            user_ids = cp.asarray(ratings_df['userId'].values)
+            movie_ids = cp.asarray(ratings_df['movieId'].values)
+            ratings = cp.asarray(ratings_df['rating'].values)
+            
+            # Get unique IDs on GPU
+            unique_users = cp.unique(user_ids)
+            unique_movies = cp.unique(movie_ids)
+            
+            # Create mappings
+            user_mapping = dict(enumerate(cp.asnumpy(unique_users)))
+            movie_mapping = dict(enumerate(cp.asnumpy(unique_movies)))
+            
+            # Create index mapping arrays on GPU
+            user_idx_map = cp.zeros(user_ids.max() + 1, dtype=cp.int32) - 1
+            movie_idx_map = cp.zeros(movie_ids.max() + 1, dtype=cp.int32) - 1
+            
+            user_idx_map[unique_users] = cp.arange(len(unique_users))
+            movie_idx_map[unique_movies] = cp.arange(len(unique_movies))
+            
+            # Map to indices
+            user_indices = user_idx_map[user_ids]
+            movie_indices = movie_idx_map[movie_ids]
+            
+            # Transfer back to CPU for scipy sparse matrix creation
+            user_indices_cpu = cp.asnumpy(user_indices)
+            movie_indices_cpu = cp.asnumpy(movie_indices)
+            ratings_cpu = cp.asnumpy(ratings)
+            
+            # Create sparse matrix
+            matrix = csr_matrix(
+                (ratings_cpu, (user_indices_cpu, movie_indices_cpu)),
+                shape=(len(user_mapping), len(movie_mapping)),
+                dtype=np.float32
+            )
+            
+            self.gpu_manager.clear_cache()
+            
+        else:
+            # CPU fallback with category codes
+            ratings_df['userId'] = ratings_df['userId'].astype('category')
+            ratings_df['movieId'] = ratings_df['movieId'].astype('category')
+            
+            user_codes = ratings_df['userId'].cat.codes.values
+            movie_codes = ratings_df['movieId'].cat.codes.values
+            
+            # Create mappings
+            user_mapping = dict(enumerate(ratings_df['userId'].cat.categories))
+            movie_mapping = dict(enumerate(ratings_df['movieId'].cat.categories))
+            
+            # Create sparse matrix in one shot
+            matrix = csr_matrix(
+                (ratings_df['rating'].values, (user_codes, movie_codes)),
+                shape=(len(user_mapping), len(movie_mapping)),
+                dtype=np.float32
+            )
+        
+        return matrix, user_mapping, movie_mapping
+    
+    def __del__(self):
+        """Cleanup GPU resources."""
+        if hasattr(self, 'gpu_manager') and self.gpu_manager.gpu_available:
+            self.gpu_manager.clear_cache()
+
+# Alias for backward compatibility
+HyperOptimizedDataTransformer = GPUHyperOptimizedDataTransformer
