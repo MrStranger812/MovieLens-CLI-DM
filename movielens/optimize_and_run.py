@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Auto-optimization script that detects system capabilities and runs with optimal settings.
+Supports multiple conda environments for different processing needs.
 """
 
 import os
@@ -10,6 +11,70 @@ import subprocess
 import platform
 from pathlib import Path
 import multiprocessing as mp
+import json
+from typing import Dict, List, Optional
+
+class EnvironmentManager:
+    """Manages conda environments and their configurations."""
+    
+    def __init__(self):
+        self.environments = {
+            'base': {
+                'name': 'movielens-base',
+                'description': 'Base environment for common data processing',
+                'requirements': 'requirements/base.txt'
+            },
+            'gpu': {
+                'name': 'movielens-gpu',
+                'description': 'GPU-accelerated environment for deep learning',
+                'requirements': 'requirements/gpu.txt'
+            },
+            'profiling': {
+                'name': 'movielens-profiling',
+                'description': 'Environment for performance profiling',
+                'requirements': 'requirements/profiling.txt'
+            },
+            'optimization': {
+                'name': 'movielens-optimization',
+                'description': 'Environment for performance optimization',
+                'requirements': 'requirements/optimization.txt'
+            },
+            'dev': {
+                'name': 'movielens-dev',
+                'description': 'Development environment with all tools',
+                'requirements': ['requirements/base.txt', 'requirements/gpu.txt', 
+                               'requirements/profiling.txt', 'requirements/optimization.txt']
+            }
+        }
+        
+    def get_available_environments(self) -> List[str]:
+        """Get list of available environments."""
+        return list(self.environments.keys())
+    
+    def get_environment_info(self, env_name: str) -> Dict:
+        """Get information about a specific environment."""
+        return self.environments.get(env_name, {})
+    
+    def activate_environment(self, env_name: str) -> bool:
+        """Activate a conda environment."""
+        if env_name not in self.environments:
+            print(f"❌ Environment {env_name} not found")
+            return False
+            
+        env_info = self.environments[env_name]
+        try:
+            # Activate the environment
+            if platform.system() == "Windows":
+                activate_cmd = f"conda activate {env_info['name']}"
+            else:
+                activate_cmd = f"source activate {env_info['name']}"
+            
+            subprocess.run(activate_cmd, shell=True, check=True)
+            print(f"✓ Activated environment: {env_info['name']}")
+            return True
+        except subprocess.CalledProcessError:
+            print(f"❌ Failed to activate environment: {env_info['name']}")
+            return False
 
 def get_system_info():
     """Get detailed system information."""
@@ -62,8 +127,8 @@ def get_numa_nodes():
         pass
     return 1
 
-def set_optimal_environment(system_info):
-    """Set optimal environment variables based on system."""
+def set_optimal_environment(system_info, env_manager: EnvironmentManager):
+    """Set optimal environment variables based on system and selected environment."""
     # CPU optimization
     n_threads = str(system_info['cpu_count'])
     os.environ['OMP_NUM_THREADS'] = n_threads
@@ -87,38 +152,39 @@ def set_optimal_environment(system_info):
     
     print(f"✓ Environment optimized for {system_info['cpu_count']} cores and {system_info['ram_gb']:.1f}GB RAM")
 
-def get_optimal_command(system_info):
-    """Determine optimal command based on system capabilities."""
+def get_optimal_command(system_info, env_name: str) -> str:
+    """Determine optimal command based on system capabilities and environment."""
     ram_gb = system_info['ram_gb']
     cpu_count = system_info['cpu_count']
     
-    # Determine mode based on RAM
-    if ram_gb >= 32:
-        mode = "ultrafast"
-        extra_args = []
-        
-        if system_info['has_gpu']:
-            extra_args.append("--gpu")
-            
-        if system_info['has_ssd']:
-            extra_args.append("--cache-dir .cache_ssd")
-            
-        return f"python analyze.py {mode} {' '.join(extra_args)}"
+    # Base command with environment activation
+    base_cmd = f"conda run -n movielens-{env_name} python analyze.py"
+    
+    # Determine mode based on RAM and environment
+    if env_name == 'gpu' and system_info['has_gpu']:
+        return f"{base_cmd} preprocess-fast --performance-mode ultrafast --gpu"
+    
+    elif env_name == 'optimization':
+        batch_size = min(500000, int(ram_gb * 50000))
+        return f"{base_cmd} preprocess-fast --performance-mode speed --batch-size {batch_size}"
+    
+    elif env_name == 'profiling':
+        return f"{base_cmd} preprocess --profile"
+    
+    elif ram_gb >= 32:
+        return f"{base_cmd} preprocess-fast --performance-mode ultrafast"
     
     elif ram_gb >= 16:
-        # Fast mode for 16-32GB RAM
         batch_size = min(500000, int(ram_gb * 50000))
-        return f"python analyze.py preprocess-fast --performance-mode speed --batch-size {batch_size}"
+        return f"{base_cmd} preprocess-fast --performance-mode speed --batch-size {batch_size}"
     
     elif ram_gb >= 8:
-        # Balanced mode for 8-16GB RAM
         batch_size = min(200000, int(ram_gb * 25000))
         n_jobs = min(cpu_count - 1, 4)
-        return f"python analyze.py preprocess --batch-size {batch_size} --n-jobs {n_jobs}"
+        return f"{base_cmd} preprocess --batch-size {batch_size} --n-jobs {n_jobs}"
     
     else:
-        # Memory-efficient mode for <8GB RAM
-        return "python analyze.py preprocess-fast --performance-mode memory --batch-size 50000"
+        return f"{base_cmd} preprocess-fast --performance-mode memory --batch-size 50000"
 
 def optimize_system():
     """Apply system-level optimizations."""
@@ -143,6 +209,9 @@ def main():
     print("🚀 MovieLens Auto-Optimization Script")
     print("="*50)
     
+    # Initialize environment manager
+    env_manager = EnvironmentManager()
+    
     # Get system info
     system_info = get_system_info()
     
@@ -154,17 +223,28 @@ def main():
     print(f"  SSD Detected: {'Yes' if system_info['has_ssd'] else 'No'}")
     print(f"  GPU Available: {'Yes' if system_info['has_gpu'] else 'No'}")
     
-
+    # Display available environments
+    print("\n🌍 Available Environments:")
+    for env_name, env_info in env_manager.environments.items():
+        print(f"  • {env_name}: {env_info['description']}")
+    
+    # Get environment selection
+    while True:
+        env_name = input("\n▶️  Select environment to use: ").strip().lower()
+        if env_name in env_manager.environments:
+            break
+        print(f"❌ Invalid environment. Choose from: {', '.join(env_manager.get_available_environments())}")
+    
     # Set optimal environment
     print(f"\n⚙️  Configuring environment...")
-    set_optimal_environment(system_info)
+    set_optimal_environment(system_info, env_manager)
     
     # Apply system optimizations if possible
     if platform.system() == "Linux":
         optimize_system()
     
     # Determine optimal command
-    command = get_optimal_command(system_info)
+    command = get_optimal_command(system_info, env_name)
     print(f"\n🎯 Optimal command: {command}")
     
     # Confirm execution

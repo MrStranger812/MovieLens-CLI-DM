@@ -19,8 +19,75 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import subprocess
+import platform
+import json
+from typing import Dict, List, Optional
 
 console = Console()
+
+class EnvironmentManager:
+    """Manages conda environments and their configurations."""
+    
+    def __init__(self):
+        self.environments = {
+            'base': {
+                'name': 'movielens-base',
+                'description': 'Base environment for common data processing',
+                'requirements': 'requirements/base.txt'
+            },
+            'gpu': {
+                'name': 'movielens-gpu',
+                'description': 'GPU-accelerated environment for deep learning',
+                'requirements': 'requirements/gpu.txt'
+            },
+            'profiling': {
+                'name': 'movielens-profiling',
+                'description': 'Environment for performance profiling',
+                'requirements': 'requirements/profiling.txt'
+            },
+            'optimization': {
+                'name': 'movielens-optimization',
+                'description': 'Environment for performance optimization',
+                'requirements': 'requirements/optimization.txt'
+            },
+            'dev': {
+                'name': 'movielens-dev',
+                'description': 'Development environment with all tools',
+                'requirements': ['requirements/base.txt', 'requirements/gpu.txt', 
+                               'requirements/profiling.txt', 'requirements/optimization.txt']
+            }
+        }
+    
+    def get_current_environment(self) -> str:
+        """Get the current conda environment name."""
+        try:
+            result = subprocess.run(['conda', 'info', '--envs'], 
+                                 capture_output=True, text=True)
+            active_env = [line for line in result.stdout.split('\n') 
+                         if '*' in line][0].split()[0]
+            return active_env
+        except:
+            return "base"
+    
+    def check_environment_compatibility(self, env_name: str, operation: str) -> bool:
+        """Check if the current environment is compatible with the operation."""
+        current_env = self.get_current_environment()
+        env_info = self.environments.get(env_name, {})
+        
+        if not env_info:
+            console.print(f"[red]❌ Environment {env_name} not found[/red]")
+            return False
+        
+        if current_env != env_info['name']:
+            console.print(f"[yellow]⚠ Warning: Operation {operation} is recommended in {env_info['name']} environment[/yellow]")
+            if not Confirm.ask(f"Continue with current environment ({current_env})?", default=False):
+                return False
+        
+        return True
+
+# Initialize environment manager
+env_manager = EnvironmentManager()
 
 class PerformanceConfig:
     """Configuration for performance optimization."""
@@ -69,21 +136,69 @@ def cli():
     console.print(Panel.fit(
         "[bold blue]MovieLens Multi-Analytics Project[/bold blue]\n"
         "Comprehensive data science analysis tool with hyper-optimized processing\n"
-        f"System: {mp.cpu_count()} cores, {psutil.virtual_memory().total / 1024**3:.1f}GB RAM",
+        f"System: {mp.cpu_count()} cores, {psutil.virtual_memory().total / 1024**3:.1f}GB RAM\n"
+        f"Current Environment: {env_manager.get_current_environment()}",
         border_style="blue"
     ))
+
+@cli.group()
+def env():
+    """Environment management commands."""
+    pass
+
+@env.command('list')
+def list_environments():
+    """List available conda environments."""
+    table = Table(title="Available Environments", box=box.ROUNDED)
+    table.add_column("Name", style="cyan")
+    table.add_column("Description", style="green")
+    table.add_column("Status", style="yellow")
+    
+    current_env = env_manager.get_current_environment()
+    
+    for env_name, env_info in env_manager.environments.items():
+        status = "✓ Active" if env_info['name'] == current_env else "Inactive"
+        table.add_row(env_info['name'], env_info['description'], status)
+    
+    console.print(table)
+
+@env.command('activate')
+@click.argument('env_name')
+def activate_environment(env_name):
+    """Activate a specific conda environment."""
+    if env_name not in env_manager.environments:
+        console.print(f"[red]❌ Environment {env_name} not found[/red]")
+        return
+    
+    env_info = env_manager.environments[env_name]
+    try:
+        if platform.system() == "Windows":
+            activate_cmd = f"conda activate {env_info['name']}"
+        else:
+            activate_cmd = f"source activate {env_info['name']}"
+        
+        subprocess.run(activate_cmd, shell=True, check=True)
+        console.print(f"[green]✓ Activated environment: {env_info['name']}[/green]")
+    except subprocess.CalledProcessError:
+        console.print(f"[red]❌ Failed to activate environment: {env_info['name']}[/red]")
 
 @cli.command()
 @click.option('--technique', type=click.Choice(['regression', 'classification', 'clustering', 'recommender', 'association', 'all']),
               default='all', help='Analysis technique to run')
 def analyze(technique):
-    """Run data analysis with specified technique.""" 
+    """Run data analysis with specified technique."""
+    if not env_manager.check_environment_compatibility('base', 'analysis'):
+        return
+    
     console.print(f"[yellow]Placeholder: Starting {technique} analysis...[/yellow]")
     console.print("[yellow]Note: Analysis functions need to be implemented.[/yellow]")
 
 @cli.command()
 def explore():
     """Explore the basic dataset info."""
+    if not env_manager.check_environment_compatibility('base', 'exploration'):
+        return
+    
     console.print("[yellow]Loading basic dataset info...[/yellow]")
     cleaner = DataCleaner()
     cleaner.load_data()
@@ -99,9 +214,15 @@ def explore():
 @click.option('--no-validation', is_flag=True, help='Skip validation steps')
 @click.option('--batch-size', type=int, default=200000, help='Batch size for processing')
 @click.option('--n-jobs', type=int, default=4, help='Number of parallel jobs')
+@click.option('--use-gpu', is_flag=True, help='Use GPU acceleration if available')
 def preprocess(skip_pca, skip_sparse, no_save, no_cache, clear_cache, memory_limit, 
-               no_validation, batch_size, n_jobs):
+               no_validation, batch_size, n_jobs, use_gpu):
     """Run hyper-optimized preprocessing pipeline with performance tuning."""
+    
+    # Check environment compatibility
+    env_name = 'gpu' if use_gpu else 'optimization'
+    if not env_manager.check_environment_compatibility(env_name, 'preprocessing'):
+        return
     
     # Display system information
     console.print("\n[bold cyan]System Information[/bold cyan]")
@@ -200,9 +321,15 @@ def preprocess(skip_pca, skip_sparse, no_save, no_cache, clear_cache, memory_lim
 @click.option('--memory-limit', type=float, help='Memory limit in GB (auto if not specified)')
 @click.option('--skip-validation', is_flag=True, help='Skip validation steps for speed')
 @click.option('--profile', is_flag=True, help='Enable performance profiling')
+@click.option('--use-gpu', is_flag=True, help='Use GPU acceleration if available')
 def preprocess_fast(performance_mode, n_jobs, batch_size, memory_limit, 
-                   skip_validation, profile):
+                   skip_validation, profile, use_gpu):
     """Run hyper-optimized preprocessing pipeline with performance tuning."""
+    
+    # Check environment compatibility
+    env_name = 'gpu' if use_gpu else 'profiling' if profile else 'optimization'
+    if not env_manager.check_environment_compatibility(env_name, 'fast preprocessing'):
+        return
     
     # Display system information
     console.print("\n[bold cyan]System Information[/bold cyan]")
