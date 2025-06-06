@@ -408,7 +408,8 @@ class GPUHyperOptimizedDataTransformer:
             
             # Create mapping for GPU operations
             movie_to_idx = cp.arange(len(unique_movies))
-            movie_idx_map = cp.zeros(movie_ids.max() + 1, dtype=cp.int32) - 1
+            max_movie_id = int(movie_ids.max().item())  
+            movie_idx_map = cp.zeros(max_movie_id + 1, dtype=cp.int32) - 1
             movie_idx_map[unique_movies] = movie_to_idx
             
             # Map movie IDs to indices
@@ -821,8 +822,10 @@ class GPUHyperOptimizedDataTransformer:
             movie_mapping = dict(enumerate(cp.asnumpy(unique_movies)))
             
             # Create index mapping arrays on GPU
-            user_idx_map = cp.zeros(user_ids.max() + 1, dtype=cp.int32) - 1
-            movie_idx_map = cp.zeros(movie_ids.max() + 1, dtype=cp.int32) - 1
+            max_user_id = int(user_ids.max().item())
+            max_movie_id = int(movie_ids.max().item())
+            user_idx_map = cp.zeros(max_user_id + 1, dtype=cp.int32) - 1
+            movie_idx_map = cp.zeros(max_movie_id + 1, dtype=cp.int32) - 1
             
             user_idx_map[unique_users] = cp.arange(len(unique_users))
             movie_idx_map[unique_movies] = cp.arange(len(unique_movies))

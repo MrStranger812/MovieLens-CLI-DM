@@ -18,12 +18,12 @@ bottleneck>=1.3.0          # Fast NumPy functions
 numexpr>=2.8.0             # Fast numerical expression evaluator
 tables>=3.7.0              # HDF5 support
 lz4>=4.0.0                 # Fast compression
-blosc>=1.10.0              # Ultra-fast compression
+blosc>=1.10.0             # Ultra-fast compression
 
 # Optional GPU acceleration
-cupy>=11.0.0             # GPU arrays (requires CUDA)
-cudf>=22.0.0             # GPU DataFrames (requires CUDA)
-rapids>=22.0.0           # Full RAPIDS suite (requires CUDA)
+# cupy>=11.0.0             # GPU arrays (requires CUDA)
+# cudf>=22.0.0             # GPU DataFrames (requires CUDA)
+# rapids>=22.0.0           # Full RAPIDS suite (requires CUDA)
 
 # Profiling and monitoring
 py-spy>=0.3.0              # Sampling profiler

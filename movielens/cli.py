@@ -164,7 +164,7 @@ def preprocess(skip_pca, skip_sparse, no_save, no_cache, clear_cache, memory_lim
         
         # Run feature engineering
         console.print("[cyan]Running hyper-optimized feature engineering...[/cyan]")
-        features = transformer.create_all_features_pipeline_hyper(
+        features = transformer.create_all_features_pipeline_gpu(
             cleaned_ratings, cleaned_movies, cleaned_tags
         )
         
