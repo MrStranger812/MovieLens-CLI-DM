@@ -25,7 +25,7 @@ class EnvironmentManager:
                 'requirements': 'requirements/base.txt'
             },
             'gpu': {
-                'name': 'movielens-gpu',
+                'name': 'movielens-rapids',
                 'description': 'GPU-accelerated environment for deep learning',
                 'requirements': 'requirements/gpu.txt'
             },

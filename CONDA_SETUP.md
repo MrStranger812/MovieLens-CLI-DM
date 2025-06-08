@@ -9,7 +9,7 @@ This project uses multiple conda environments to separate different aspects of d
 - Used for general development and running basic scripts
 - Includes: pandas, numpy, scipy, matplotlib, seaborn, plotly, and CLI tools
 
-### 2. GPU Environment (`movielens-gpu`)
+### 2. GPU Environment (`movielens-rapids`)
 - Optimized for deep learning and GPU-accelerated computations
 - Includes TensorFlow and PyTorch with GPU support
 - Use this environment for training deep learning models and heavy computations
@@ -52,14 +52,14 @@ conda activate <env-name>
 
 For example:
 ```bash
-conda activate movielens-gpu  # For GPU-accelerated work
+conda activate movielens-rapids  # For GPU-accelerated work
 conda activate movielens-profiling  # For performance profiling
 ```
 
 ## Environment Selection Guide
 
 - Use `movielens-base` for general development and running basic scripts
-- Use `movielens-gpu` when working with deep learning models or GPU-accelerated computations
+- Use `movielens-rapids` when working with deep learning models or GPU-accelerated computations
 - Use `movielens-profiling` when you need to analyze code performance
 - Use `movielens-optimization` when working on performance optimization
 - Use `movielens-docs` when generating or updating documentation

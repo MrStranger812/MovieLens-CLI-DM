@@ -28,7 +28,7 @@ class EnvironmentValidator:
                 'required_files': ['requirements/base.txt']
             },
             'gpu': {
-                'name': 'movielens-gpu',
+                'name': 'movielens-rapids',
                 'required_packages': ['pandas', 'numpy', 'scipy', 'matplotlib', 'seaborn', 'plotly', 'torch', 'cuda-python'],
                 'required_files': ['requirements/gpu.txt']
             },
@@ -177,7 +177,7 @@ def validate(env: Optional[str], fix: bool):
 • Basic data processing and analysis
 • Command: python analyze.py preprocess --performance-mode balanced
 
-[bold]GPU Environment (movielens-gpu)[/bold]
+[bold]GPU Environment (movielens-rapids)[/bold]
 • Deep learning and GPU-accelerated processing
 • Command: python analyze.py preprocess --performance-mode speed --use-gpu
 
