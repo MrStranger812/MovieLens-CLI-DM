@@ -195,3 +195,8 @@ data/processed/ratings_cleaned.parquet
 data/processed/tags_cleaned.parquet
 data/processed/transformers.pkl
 data/processed/user_features.parquet
+rmm_log.txt
+data/processed/Movielens-GPU made/hyper_features.pkl.gz
+data/processed/Movielens-GPU made/ml_ready_datasets.pkl.gz
+data/processed/Movielens-GPU made/user_item_matrix.npz
+requirements/
