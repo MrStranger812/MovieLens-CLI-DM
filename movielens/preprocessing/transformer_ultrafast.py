@@ -279,86 +279,172 @@ class HyperOptimizedDataTransformer:
         return movie_features
     
     def create_ml_datasets(self, ratings_df: pd.DataFrame, 
-                          user_features: pd.DataFrame,
-                          movie_features: pd.DataFrame) -> Dict:
-        """Create ML datasets focusing on regression and classification only."""
-        self.console.print("[cyan]Creating ML datasets (regression & classification only)...[/cyan]")
-        
-        ml_datasets = {}
-        
-        try:
-            # Sample data for memory efficiency with 4GB VRAM
-            sample_size = min(1_000_000, len(ratings_df))
-            if len(ratings_df) > sample_size:
-                self.console.print(f"[yellow]Sampling {sample_size:,} ratings for ML datasets (4GB VRAM limit)[/yellow]")
-                ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
-            else:
-                ratings_sample = ratings_df
+                            user_features: pd.DataFrame,
+                            movie_features: pd.DataFrame) -> Dict:
+            """Create ML datasets focusing on regression and classification only."""
+            self.console.print("[cyan]Creating ML datasets (regression & classification only)...[/cyan]")
             
-            # Prepare feature matrix
-            self.console.print("[cyan]Merging features for supervised learning...[/cyan]")
+            ml_datasets = {}
             
-            # Merge in chunks to save memory
-            feature_matrix = ratings_sample[['userId', 'movieId', 'rating']].copy()
+            try:
+                # Validate and clean features first
+                self.console.print("[cyan]Validating feature data types...[/cyan]")
+                
+                # Clean user features - only numeric columns
+                user_clean = user_features.select_dtypes(include=[np.number]).copy()
+                user_clean = user_clean.fillna(0).replace([np.inf, -np.inf], 0)
+                
+                # Remove problematic columns
+                problematic_cols = ['timestamp_min', 'timestamp_max']
+                user_clean = user_clean.drop(columns=[col for col in problematic_cols if col in user_clean.columns])
+                
+                # Clean movie features - only numeric columns
+                movie_clean = movie_features.select_dtypes(include=[np.number]).copy()
+                movie_clean = movie_clean.fillna(0).replace([np.inf, -np.inf], 0)
+                
+                # Remove problematic columns
+                movie_clean = movie_clean.drop(columns=[col for col in problematic_cols if col in movie_clean.columns])
+                
+                self.console.print(f"[green]User features: {user_clean.shape[1]} numeric columns[/green]")
+                self.console.print(f"[green]Movie features: {movie_clean.shape[1]} numeric columns[/green]")
+                
+                # Sample data for memory efficiency with 4GB VRAM
+                sample_size = min(800_000, len(ratings_df))  # Reduced for 4GB
+                if len(ratings_df) > sample_size:
+                    self.console.print(f"[yellow]Sampling {sample_size:,} ratings for ML datasets (4GB VRAM limit)[/yellow]")
+                    ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
+                else:
+                    ratings_sample = ratings_df
+                
+                # Build feature matrix step by step to control memory
+                self.console.print("[cyan]Building feature matrix...[/cyan]")
+                
+                # Start with core data
+                feature_matrix = ratings_sample[['userId', 'movieId', 'rating']].copy()
+                
+                # Limit features to prevent memory issues (4GB VRAM constraint)
+                max_user_features = 30
+                max_movie_features = 30
+                
+                # Add user features via efficient mapping
+                user_cols = user_clean.columns[:max_user_features].tolist()
+                self.console.print(f"[cyan]Adding {len(user_cols)} user features...[/cyan]")
+                
+                for col in user_cols:
+                    feature_matrix[f'user_{col}'] = feature_matrix['userId'].map(
+                        user_clean[col].to_dict()
+                    ).fillna(0).astype(np.float32)
+                
+                # Add movie features via efficient mapping
+                movie_cols = movie_clean.columns[:max_movie_features].tolist()
+                self.console.print(f"[cyan]Adding {len(movie_cols)} movie features...[/cyan]")
+                
+                for col in movie_cols:
+                    feature_matrix[f'movie_{col}'] = feature_matrix['movieId'].map(
+                        movie_clean[col].to_dict()
+                    ).fillna(0).astype(np.float32)
+                
+                # Final data preparation
+                feature_cols = [col for col in feature_matrix.columns 
+                            if col not in ['userId', 'movieId', 'rating']]
+                
+                self.console.print(f"[green]Final feature matrix: {feature_matrix.shape} with {len(feature_cols)} features[/green]")
+                
+                # Extract features and targets
+                X = feature_matrix[feature_cols].values.astype(np.float32)
+                y_reg = feature_matrix['rating'].values.astype(np.float32)
+                y_clf = (feature_matrix['rating'] >= 4.0).astype(np.int32)
+                
+                # Validate arrays
+                if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+                    self.console.print("[yellow]Cleaning remaining NaN/inf values in features[/yellow]")
+                    X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # Create regression dataset
+                self.console.print("[cyan]Creating regression dataset...[/cyan]")
+                ml_datasets['regression'] = {
+                    'X': X,
+                    'y': y_reg,
+                    'feature_names': feature_cols,
+                    'n_samples': len(X),
+                    'n_features': len(feature_cols)
+                }
+                
+                # Create classification dataset (binary: good/bad rating)
+                self.console.print("[cyan]Creating classification dataset...[/cyan]")
+                ml_datasets['classification'] = {
+                    'X': X,  # Reuse same feature matrix
+                    'y': y_clf,
+                    'feature_names': feature_cols,
+                    'n_samples': len(X),
+                    'n_features': len(feature_cols),
+                    'class_balance': {
+                        'positive': float(np.sum(y_clf == 1) / len(y_clf)),
+                        'negative': float(np.sum(y_clf == 0) / len(y_clf))
+                    }
+                }
+                
+                # Create placeholder clustering datasets (simplified for 4GB)
+                self.console.print("[cyan]Creating simplified clustering datasets...[/cyan]")
+                
+                # User clustering (limited features for memory)
+                user_cluster_data = user_clean.iloc[:, :15].values.astype(np.float32)
+                ml_datasets['clustering_users'] = {
+                    'X': user_cluster_data,
+                    'feature_names': user_clean.columns[:15].tolist(),
+                    'user_ids': user_clean.index.tolist(),
+                    'n_samples': len(user_cluster_data),
+                    'n_features': user_cluster_data.shape[1]
+                }
+                
+                # Movie clustering (limited features for memory)  
+                movie_cluster_data = movie_clean.iloc[:, :15].values.astype(np.float32)
+                ml_datasets['clustering_movies'] = {
+                    'X': movie_cluster_data,
+                    'feature_names': movie_clean.columns[:15].tolist(),
+                    'movie_ids': movie_clean.index.tolist(),
+                    'n_samples': len(movie_cluster_data),
+                    'n_features': movie_cluster_data.shape[1]
+                }
+                
+                # Association rules (simple)
+                high_ratings = ratings_sample[ratings_sample['rating'] >= 4.0]
+                transactions = high_ratings.groupby('userId')['movieId'].apply(list).tolist()
+                ml_datasets['association_rules'] = {
+                    'transactions': transactions,
+                    'min_support': 0.01,
+                    'min_confidence': 0.5,
+                    'n_transactions': len(transactions)
+                }
+                
+                # Clean up intermediate variables
+                del feature_matrix
+                gc.collect()
+                
+                self.console.print("[green]✓ ML datasets created successfully[/green]")
+                
+                # Log dataset info
+                for name, dataset in ml_datasets.items():
+                    if dataset and 'X' in dataset:
+                        self.console.print(f"[green]{name}: {dataset['X'].shape}[/green]")
+                    elif dataset and 'transactions' in dataset:
+                        self.console.print(f"[green]{name}: {len(dataset['transactions'])} transactions[/green]")
+                
+            except Exception as e:
+                self.console.print(f"[red]Error creating ML datasets: {e}[/red]")
+                import traceback
+                traceback.print_exc()
+                
+                # Return None for failed datasets
+                ml_datasets = {
+                    'regression': None,
+                    'classification': None,
+                    'clustering_users': None,
+                    'clustering_movies': None,
+                    'association_rules': None
+                }
             
-            # Add user features
-            user_feature_cols = [col for col in user_features.columns if col not in ['genre_list', 'clean_title']]
-            feature_matrix = feature_matrix.merge(
-                user_features[user_feature_cols], 
-                left_on='userId', 
-                right_index=True, 
-                how='left',
-                suffixes=('', '_user')
-            )
-            
-            # Add movie features
-            movie_feature_cols = [col for col in movie_features.columns if col not in ['genre_list', 'clean_title', 'title', 'genres']]
-            feature_matrix = feature_matrix.merge(
-                movie_features[movie_feature_cols], 
-                left_on='movieId', 
-                right_index=True, 
-                how='left',
-                suffixes=('', '_movie')
-            )
-            
-            # Fill NaN values
-            feature_matrix = feature_matrix.fillna(0)
-            
-            # Select feature columns (exclude identifiers and target)
-            feature_cols = [col for col in feature_matrix.columns 
-                           if col not in ['userId', 'movieId', 'rating'] 
-                           and feature_matrix[col].dtype in [np.float32, np.float64, np.int32, np.int64, np.int8]]
-            
-            X = feature_matrix[feature_cols].values.astype(np.float32)
-            
-            # Regression dataset
-            self.console.print("[cyan]Creating regression dataset...[/cyan]")
-            ml_datasets['regression'] = {
-                'X': X,
-                'y': feature_matrix['rating'].values.astype(np.float32),
-                'feature_names': feature_cols
-            }
-            
-            # Classification dataset (binary: good/bad rating)
-            self.console.print("[cyan]Creating classification dataset...[/cyan]")
-            ml_datasets['classification'] = {
-                'X': X,
-                'y': (feature_matrix['rating'] >= 4.0).astype(np.int32).values,
-                'feature_names': feature_cols
-            }
-            
-            # Clean up
-            del feature_matrix
-            gc.collect()
-            
-            self.console.print("[green]✓ ML datasets created successfully[/green]")
-            
-        except Exception as e:
-            self.console.print(f"[red]Error creating ML datasets: {e}[/red]")
-            import traceback
-            traceback.print_exc()
-        
-        return ml_datasets
+            return ml_datasets
     
     def create_all_features_pipeline(self, ratings_df: pd.DataFrame, 
                                    movies_df: pd.DataFrame, 

@@ -216,101 +216,198 @@ class DataTransformer:
         return df_clean
     
     def create_user_features(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
-        """Create comprehensive user-based features using parallel processing."""
-        self.console.print("[cyan]Creating user features (pandarallel)...[/cyan]")
+            """Create comprehensive user-based features using parallel processing."""
+            self.console.print("[cyan]Creating user features (pandarallel)...[/cyan]")
+            
+            user_features = ratings_df.groupby('userId').apply(
+                lambda x: pd.Series({
+                    'rating_count': len(x),
+                    'rating_mean': x['rating'].mean(),
+                    'rating_std': x['rating'].std(),
+                    'rating_min': x['rating'].min(),
+                    'rating_max': x['rating'].max(),
+                    'movieId_nunique': x['movieId'].nunique(),
+                    'timestamp_min': x['timestamp'].min(),
+                    'timestamp_max': x['timestamp'].max()
+                })
+            )
+            
+            user_features['rating_std'] = user_features['rating_std'].fillna(0)
+            user_features['activity_span_days'] = (
+                user_features['timestamp_max'] - user_features['timestamp_min']
+            ).dt.total_seconds() / (24 * 3600)
+            
+            user_features['rating_frequency'] = (
+                user_features['rating_count'] / (user_features['activity_span_days'] + 1)
+            )
+            
+            user_features['rating_range'] = user_features['rating_max'] - user_features['rating_min']
+            user_features['is_active_user'] = (user_features['rating_count'] > user_features['rating_count'].quantile(0.75)).astype(int)
+            user_features['is_picky_user'] = (user_features['rating_std'] > user_features['rating_std'].quantile(0.75)).astype(int)
+            
+            # Drop datetime columns that cause issues in merging
+            user_features = user_features.drop(['timestamp_min', 'timestamp_max'], axis=1, errors='ignore')
+            
+            # Ensure all columns are numeric scalars
+            for col in user_features.columns:
+                if user_features[col].dtype == 'object':
+                    user_features = user_features.drop(columns=[col])
+                elif user_features[col].dtype in ['datetime64[ns]', 'datetime64[ns, UTC]']:
+                    user_features = user_features.drop(columns=[col])
+            
+            # Fill any remaining NaN values
+            user_features = user_features.fillna(0)
+            
+            # Optimize data types
+            user_features = self.optimize_dtypes(user_features)
+            
+            self.console.print(f"[green]✓ Created {len(user_features.columns)} user features using pandarallel[/green]")
+            return user_features
         
-        user_features = ratings_df.groupby('userId').apply(
-            lambda x: pd.Series({
-                'rating_count': len(x),
-                'rating_mean': x['rating'].mean(),
-                'rating_std': x['rating'].std(),
-                'rating_min': x['rating'].min(),
-                'rating_max': x['rating'].max(),
-                'movieId_nunique': x['movieId'].nunique(),
-                'timestamp_min': x['timestamp'].min(),
-                'timestamp_max': x['timestamp'].max()
-            })
-        )
-        
-        user_features['rating_std'] = user_features['rating_std'].fillna(0)
-        user_features['activity_span_days'] = (
-            user_features['timestamp_max'] - user_features['timestamp_min']
-        ).dt.total_seconds() / (24 * 3600)
-        
-        user_features['rating_frequency'] = (
-            user_features['rating_count'] / (user_features['activity_span_days'] + 1)
-        )
-        
-        user_features['rating_range'] = user_features['rating_max'] - user_features['rating_min']
-        user_features['is_active_user'] = (user_features['rating_count'] > user_features['rating_count'].quantile(0.75)).astype(int)
-        user_features['is_picky_user'] = (user_features['rating_std'] > user_features['rating_std'].quantile(0.75)).astype(int)
-        
-        self.console.print(f"[green]✓ Created {len(user_features.columns)} user features using pandarallel[/green]")
-        return user_features
-    
     def create_movie_features(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> pd.DataFrame:
-        """Create comprehensive movie-based features using parallel processing."""
-        self.console.print("[cyan]Creating movie features (pandarallel)...[/cyan]")
-        
-        movie_features = ratings_df.groupby('movieId').apply(
-            lambda x: pd.Series({
-                'rating_count': len(x),
-                'rating_mean': x['rating'].mean(),
-                'rating_std': x['rating'].std(),
-                'rating_min': x['rating'].min(),
-                'rating_max': x['rating'].max(),
-                'userId_nunique': x['userId'].nunique(),
-                'timestamp_min': x['timestamp'].min(),
-                'timestamp_max': x['timestamp'].max()
-            })
-        )
-        
-        movie_features = movie_features.join(movies_df.set_index('movieId'), how='left')
-        
-        if 'genre_list' in movie_features.columns:
-            movie_features['genre_count'] = movie_features['genre_list'].apply(
-                lambda x: len(x) if isinstance(x, list) else 0
+            """Create comprehensive movie-based features using parallel processing."""
+            self.console.print("[cyan]Creating movie features (pandarallel)...[/cyan]")
+            
+            movie_features = ratings_df.groupby('movieId').apply(
+                lambda x: pd.Series({
+                    'rating_count': len(x),
+                    'rating_mean': x['rating'].mean(),
+                    'rating_std': x['rating'].std(),
+                    'rating_min': x['rating'].min(),
+                    'rating_max': x['rating'].max(),
+                    'userId_nunique': x['userId'].nunique(),
+                    'timestamp_min': x['timestamp'].min(),
+                    'timestamp_max': x['timestamp'].max()
+                })
             )
             
-            all_genres = []
-            for genre_list in movie_features['genre_list'].dropna():
-                if isinstance(genre_list, list):
-                    all_genres.extend(genre_list)
+            # Merge with movie metadata - be careful with columns
+            movie_metadata = movies_df.set_index('movieId')
             
-            top_genres = pd.Series(all_genres).value_counts().head(10).index.tolist()
+            # Only merge safe columns (not lists or complex objects)
+            safe_movie_columns = []
+            for col in movie_metadata.columns:
+                if col in ['year'] or (movie_metadata[col].dtype in ['int64', 'float64', 'int32', 'float32']):
+                    safe_movie_columns.append(col)
             
-            def create_genre_feature(genre):
-                if genre != '(no genres listed)':
-                    return movie_features['genre_list'].apply(
-                        lambda x: 1 if isinstance(x, list) and genre in x else 0
-                    )
-                return pd.Series(0, index=movie_features.index)
+            if safe_movie_columns:
+                movie_features = movie_features.join(movie_metadata[safe_movie_columns], how='left')
             
-            genre_features = Parallel(n_jobs=self.n_jobs)(
-                delayed(create_genre_feature)(genre) for genre in top_genres
-            )
+            # Handle genre features more carefully
+            if 'genre_list' in movies_df.columns:
+                movie_features['genre_count'] = movies_df.set_index('movieId')['genre_list'].apply(
+                    lambda x: len(x) if isinstance(x, list) else 0
+                ).reindex(movie_features.index, fill_value=0)
+                
+                # Create binary features for top genres only (avoid memory issues)
+                all_genres = []
+                for genre_list in movies_df['genre_list'].dropna():
+                    if isinstance(genre_list, list):
+                        all_genres.extend(genre_list)
+                
+                top_genres = pd.Series(all_genres).value_counts().head(5).index.tolist()  # Only top 5
+                
+                for genre in top_genres:
+                    if genre != '(no genres listed)':
+                        safe_genre_name = genre.lower().replace(" ", "_").replace("-", "_")
+                        movie_features[f'is_{safe_genre_name}'] = movies_df.set_index('movieId')['genre_list'].apply(
+                            lambda x: 1 if isinstance(x, list) and genre in x else 0
+                        ).reindex(movie_features.index, fill_value=0).astype(int)
             
-            for i, genre in enumerate(top_genres):
-                if genre != '(no genres listed)':
-                    movie_features[f'is_{genre.lower().replace(" ", "_").replace("-", "_")}'] = genre_features[i]
-        
-        current_year = pd.Timestamp.now().year
-        movie_features['movie_age'] = current_year - movie_features['year'].fillna(current_year)
-        movie_features['popularity_score'] = (
-            movie_features['rating_count'] * movie_features['rating_mean']
-        ).fillna(0)
-        
-        movie_features['rating_std'] = movie_features['rating_std'].fillna(0)
-        movie_features['is_popular'] = (
-            movie_features['rating_count'] > movie_features['rating_count'].quantile(0.8)
-        ).astype(int)
-        movie_features['is_highly_rated'] = (
-            movie_features['rating_mean'] > movie_features['rating_mean'].quantile(0.8)
-        ).astype(int)
-        
-        self.console.print(f"[green]✓ Created {len(movie_features.columns)} movie features using pandarallel[/green]")
-        return movie_features
-    
+            # Add derived features
+            current_year = pd.Timestamp.now().year
+            if 'year' in movie_features.columns:
+                movie_features['movie_age'] = current_year - movie_features['year'].fillna(current_year)
+            else:
+                movie_features['movie_age'] = 0
+                
+            movie_features['popularity_score'] = (
+                movie_features['rating_count'] * movie_features['rating_mean']
+            ).fillna(0)
+            
+            movie_features['rating_std'] = movie_features['rating_std'].fillna(0)
+            movie_features['is_popular'] = (
+                movie_features['rating_count'] > movie_features['rating_count'].quantile(0.8)
+            ).astype(int)
+            movie_features['is_highly_rated'] = (
+                movie_features['rating_mean'] > movie_features['rating_mean'].quantile(0.8)
+            ).astype(int)
+            
+            # Drop problematic columns
+            columns_to_drop = ['timestamp_min', 'timestamp_max', 'genre_list', 'title', 'clean_title', 'genres']
+            movie_features = movie_features.drop(columns=[col for col in columns_to_drop if col in movie_features.columns])
+            
+            # Ensure all columns are numeric scalars
+            for col in movie_features.columns:
+                if movie_features[col].dtype == 'object':
+                    # Try to convert to numeric
+                    try:
+                        movie_features[col] = pd.to_numeric(movie_features[col], errors='coerce').fillna(0)
+                    except:
+                        movie_features = movie_features.drop(columns=[col])
+                elif movie_features[col].dtype in ['datetime64[ns]', 'datetime64[ns, UTC]']:
+                    movie_features = movie_features.drop(columns=[col])
+            
+            # Fill any remaining NaN values
+            movie_features = movie_features.fillna(0)
+            
+            # Optimize data types
+            movie_features = self.optimize_dtypes(movie_features)
+            
+            self.console.print(f"[green]✓ Created {len(movie_features.columns)} movie features using pandarallel[/green]")
+            return movie_features
+
+    def validate_features_for_ml(self, user_features: pd.DataFrame, movie_features: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+            """Validate and clean features specifically for ML dataset creation."""
+            self.console.print("[cyan]Validating features for ML dataset creation...[/cyan]")
+            
+            # Clean user features
+            user_clean = user_features.copy()
+            
+            # Remove non-numeric columns
+            non_numeric_user = user_clean.select_dtypes(exclude=[np.number]).columns.tolist()
+            if non_numeric_user:
+                self.console.print(f"[yellow]Removing {len(non_numeric_user)} non-numeric user columns[/yellow]")
+                user_clean = user_clean.drop(columns=non_numeric_user)
+            
+            # Check for and handle any remaining complex data types
+            for col in user_clean.columns:
+                if user_clean[col].dtype == 'object':
+                    try:
+                        user_clean[col] = pd.to_numeric(user_clean[col], errors='coerce')
+                    except:
+                        user_clean = user_clean.drop(columns=[col])
+            
+            # Clean movie features  
+            movie_clean = movie_features.copy()
+            
+            # Remove non-numeric columns
+            non_numeric_movie = movie_clean.select_dtypes(exclude=[np.number]).columns.tolist()
+            if non_numeric_movie:
+                self.console.print(f"[yellow]Removing {len(non_numeric_movie)} non-numeric movie columns[/yellow]")
+                movie_clean = movie_clean.drop(columns=non_numeric_movie)
+            
+            # Check for and handle any remaining complex data types
+            for col in movie_clean.columns:
+                if movie_clean[col].dtype == 'object':
+                    try:
+                        movie_clean[col] = pd.to_numeric(movie_clean[col], errors='coerce')
+                    except:
+                        movie_clean = movie_clean.drop(columns=[col])
+            
+            # Fill NaN values
+            user_clean = user_clean.fillna(0)
+            movie_clean = movie_clean.fillna(0)
+            
+            # Final validation - ensure all values are finite
+            user_clean = user_clean.replace([np.inf, -np.inf], 0)
+            movie_clean = movie_clean.replace([np.inf, -np.inf], 0)
+            
+            self.console.print(f"[green]✓ User features: {user_clean.shape[1]} valid columns[/green]")
+            self.console.print(f"[green]✓ Movie features: {movie_clean.shape[1]} valid columns[/green]")
+            
+            return user_clean, movie_clean
+   
     def create_temporal_features(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Create advanced temporal features using parallel processing."""
         self.console.print("[cyan]Creating temporal features (parallel)...[/cyan]")
