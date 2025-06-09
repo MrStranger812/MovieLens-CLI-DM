@@ -821,7 +821,6 @@ def preprocess_gpu_fixed(use_gpu, batch_size, sample_size):
             cleaned_ratings, 
             cleaned_movies, 
             cleaned_tags,
-            batch_size=batch_size
         )
         
         # Create ML datasets
@@ -847,7 +846,7 @@ def preprocess_gpu_fixed(use_gpu, batch_size, sample_size):
                 console.print(f"Association rules: {dataset['n_transactions']:,} transactions")
         
     except Exception as e:
-        console.print(f"\n[bold red]Error: {e}[/red]")
+        console.print(f"\n[bold red]Error: {e}[/bold red]")
         import traceback
         console.print(traceback.format_exc())
         
@@ -901,10 +900,6 @@ def test_ml_datasets():
     except Exception as e:
         console.print(f"[red]Error loading ML datasets: {e}[/red]")
 
-# Update the preprocess command to use the fixed pipeline
-@cli.command()
-@click.option('--gpu-fixed', is_flag=True, help='Use 4GB VRAM optimized pipeline')
-@click.option('--batch-size', type=int, default=200000)
 @cli.command()
 @click.option('--gpu-fixed', is_flag=True, help='Use 4GB VRAM optimized pipeline')
 @click.option('--batch-size', type=int, default=200000)
