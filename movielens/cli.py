@@ -8,8 +8,14 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from .config import PROCESSED_DATA_DIR
 from .preprocessing.cleaner import DataCleaner
 from .preprocessing.pipeline import PreprocessingPipeline
-from .preprocessing.transformer import DataTransformer
-from .preprocessing.transformer_ultrafast import HyperOptimizedDataTransformer
+try:
+    # Try to import the fixed GPU transformer first
+    from .preprocessing.transformer_ultrafast_fixed import HyperOptimizedDataTransformer
+    GPU_TRANSFORMER_AVAILABLE = True
+except ImportError:
+    # Fall back to regular transformer
+    from .preprocessing.transformer import DataTransformer as HyperOptimizedDataTransformer
+    GPU_TRANSFORMER_AVAILABLE = False
 import pickle
 import gzip
 import multiprocessing as mp
@@ -23,6 +29,8 @@ import subprocess
 import platform
 import json
 from typing import Dict, List, Optional
+import gc
+
 
 console = Console()
 
@@ -126,9 +134,13 @@ class PerformanceConfig:
             self.skip_validation = False
             self.enable_numba = True
     
+    
     def get_transformer(self) -> HyperOptimizedDataTransformer:
         """Get configured transformer instance."""
-        return HyperOptimizedDataTransformer(n_jobs=self.n_jobs)
+        return HyperOptimizedDataTransformer(
+            n_jobs=self.n_jobs,
+            use_gpu=GPU_TRANSFORMER_AVAILABLE
+        )
 
 @click.group()
 def cli():
@@ -260,6 +272,8 @@ def preprocess(skip_pca, skip_sparse, no_save, no_cache, clear_cache, memory_lim
                 cache_path.unlink()
                 console.print(f"[yellow]  ✓ Cleared: {cache_path.name}[/yellow]")
 
+    
+
     if not Confirm.ask("Proceed with hyper-optimized preprocessing?", default=True):
         console.print("[yellow]Preprocessing cancelled.[/yellow]")
         return
@@ -307,11 +321,15 @@ def preprocess(skip_pca, skip_sparse, no_save, no_cache, clear_cache, memory_lim
         
         # Display performance metrics
         display_hyper_performance_metrics(features, ml_datasets, total_time, actual_n_jobs)
-        
+    
+
+
     except Exception as e:
         console.print(f"\n[bold red]❌ Pipeline error: {e}[/bold red]")
         import traceback
         console.print(traceback.format_exc())
+
+
 
 @cli.command()
 @click.option('--performance-mode', type=click.Choice(['speed', 'balanced', 'memory']), 
@@ -405,7 +423,7 @@ def preprocess_fast(performance_mode, n_jobs, batch_size, memory_limit,
         cleaned_tags = cleaner.clean_tags(save=False) if tags_df is not None else None
         
         # Run hyper-optimized feature engineering
-        features = transformer.create_all_features_pipeline_hyper(
+        features = transformer.create_all_features_pipeline_gpu(
             cleaned_ratings, cleaned_movies, cleaned_tags
         )
         
@@ -482,6 +500,16 @@ def benchmark(iterations, modes):
                     ratings_sample, movies_df, tags_df
                 )
                 
+                # Create ML datasets (use fixed version if GPU available)
+                if GPU_TRANSFORMER_AVAILABLE:
+                    ml_datasets = create_ml_datasets_fixed(
+                        ratings_sample, features, movies_df, config.n_jobs
+                    )
+                else:
+                    ml_datasets = create_ml_datasets_hyper_optimized(
+                        ratings_sample, features, movies_df, config.n_jobs
+                    )
+                
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 
@@ -503,6 +531,7 @@ def benchmark(iterations, modes):
     
     # Display benchmark results
     display_benchmark_results(results)
+
 
 @cli.command()
 def summary():
@@ -595,6 +624,9 @@ def get_dataset(task):
                     feature_sample.append(f"... {len(dataset['feature_names']) - 5} more")
                 info_table.add_row("Sample Features", ", ".join(map(str, feature_sample)))
 
+            if 'class_balance' in dataset and task == 'classification':
+                info_table.add_row("Class Balance", f"Positive: {dataset['class_balance']['positive']:.2%}, Negative: {dataset['class_balance']['negative']:.2%}")
+
         elif task == 'association_rules':
             transactions = dataset.get('transactions', [])
             info_table.add_row("Type", "Association Rules")
@@ -602,11 +634,17 @@ def get_dataset(task):
             info_table.add_row("Min Support", str(dataset.get('min_support')))
             info_table.add_row("Min Confidence", str(dataset.get('min_confidence')))
 
+        if 'n_samples' in dataset:
+            info_table.add_row("Confirmed Samples", f"{dataset['n_samples']:,}")
+        if 'n_features' in dataset:
+            info_table.add_row("Confirmed Features", f"{dataset['n_features']}")
+
         console.print(info_table)
         
     except Exception as e:
         console.print(f"[red]Error loading dataset: {e}[/red]")
 
+        
 @cli.command()
 def validate():
     """Validate all preprocessed ML datasets."""
@@ -746,6 +784,208 @@ def preprocess_optimized(memory_limit, ultra_fast):
         import traceback
         console.print(traceback.format_exc())
 
+@cli.command()
+@click.option('--use-gpu', is_flag=True, help='Use GPU acceleration')
+@click.option('--batch-size', type=int, default=100000, help='Batch size for processing')
+@click.option('--sample-size', type=int, default=1000000, help='Sample size for ML datasets')
+def preprocess_gpu_fixed(use_gpu, batch_size, sample_size):
+    """Run preprocessing optimized for 4GB VRAM GPUs."""
+    
+    console.print("\n[bold cyan]4GB VRAM Optimized Preprocessing[/bold cyan]")
+    console.print(f"GPU: {'Enabled' if use_gpu and GPU_TRANSFORMER_AVAILABLE else 'Disabled'}")
+    console.print(f"Batch size: {batch_size:,}")
+    console.print(f"ML sample size: {sample_size:,}")
+    
+    start_time = time.time()
+    
+    try:
+        # Initialize fixed transformer
+        transformer = HyperOptimizedDataTransformer(
+            use_gpu=use_gpu and GPU_TRANSFORMER_AVAILABLE,
+            n_jobs=mp.cpu_count()
+        )
+        
+        # Load data
+        cleaner = DataCleaner()
+        ratings_df, movies_df, tags_df = cleaner.load_data()
+        
+        # Clean data
+        console.print("\n[cyan]Cleaning data...[/cyan]")
+        cleaned_ratings = cleaner.clean_ratings(save=False, optimize_memory=True)
+        cleaned_movies = cleaner.clean_movies(save=False)
+        cleaned_tags = cleaner.clean_tags(save=False) if tags_df is not None else None
+        
+        # Run feature engineering
+        console.print("\n[cyan]Creating features...[/cyan]")
+        features = transformer.create_all_features_pipeline(
+            cleaned_ratings, 
+            cleaned_movies, 
+            cleaned_tags,
+            batch_size=batch_size
+        )
+        
+        # Create ML datasets
+        console.print("\n[cyan]Creating ML datasets...[/cyan]")
+        ml_datasets = create_ml_datasets_fixed(
+            cleaned_ratings, features, cleaned_movies, transformer.n_jobs
+        )
+        
+        # Save results
+        console.print("\n[cyan]Saving results...[/cyan]")
+        save_results_hyper_optimized(features, ml_datasets, transformer.n_jobs)
+        
+        elapsed = time.time() - start_time
+        console.print(f"\n[bold green]✅ Complete in {elapsed:.1f} seconds![/bold green]")
+        
+        # Show what was created
+        for task, dataset in ml_datasets.items():
+            if dataset and 'X' in dataset and hasattr(dataset['X'], 'shape'):
+                console.print(f"{task.title()} dataset: {dataset['X'].shape}")
+                if task == 'classification' and 'class_balance' in dataset:
+                    console.print(f"Class balance: {dataset['class_balance']}")
+            elif dataset and task == 'association_rules':
+                console.print(f"Association rules: {dataset['n_transactions']:,} transactions")
+        
+    except Exception as e:
+        console.print(f"\n[bold red]Error: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
+        
+    finally:
+        # Cleanup
+        gc.collect()
+        if use_gpu and GPU_TRANSFORMER_AVAILABLE:
+            try:
+                import cupy as cp
+                cp.get_default_memory_pool().free_all_blocks()
+            except:
+                pass
+
+
+@cli.command()
+def test_ml_datasets():
+    """Test if ML datasets were created properly."""
+    
+    import gzip
+    import pickle
+    from pathlib import Path
+    
+    ml_path = Path("data/processed/ml_ready_datasets.pkl.gz")
+    
+    if not ml_path.exists():
+        console.print("[red]ML datasets not found![/red]")
+        return
+    
+    console.print("[cyan]Loading ML datasets...[/cyan]")
+    
+    try:
+        with gzip.open(ml_path, 'rb') as f:
+            ml_datasets = pickle.load(f)
+        
+        console.print("\n[bold]ML Datasets Status:[/bold]")
+        
+        for task, data in ml_datasets.items():
+            if data is None:
+                console.print(f"[yellow]{task}: Not created (None)[/yellow]")
+            elif isinstance(data, dict) and 'X' in data:
+                X = data['X']
+                y = data['y']
+                console.print(f"[green]{task}: {X.shape} samples, {y.shape} targets[/green]")
+                
+                if task == 'classification' and 'class_balance' in data:
+                    balance = data['class_balance']
+                    console.print(f"  Class balance: {balance}")
+            else:
+                console.print(f"[red]{task}: Invalid format[/red]")
+                
+    except Exception as e:
+        console.print(f"[red]Error loading ML datasets: {e}[/red]")
+
+# Update the preprocess command to use the fixed pipeline
+@cli.command()
+@click.option('--gpu-fixed', is_flag=True, help='Use 4GB VRAM optimized pipeline')
+@click.option('--batch-size', type=int, default=200000)
+@cli.command()
+@click.option('--gpu-fixed', is_flag=True, help='Use 4GB VRAM optimized pipeline')
+@click.option('--batch-size', type=int, default=200000)
+def preprocess_4gb(gpu_fixed, batch_size):
+    """Run preprocessing with 4GB VRAM optimization."""
+    
+    if gpu_fixed:
+        # Use the pipeline-based approach
+        try:
+            from .preprocessing.pipeline_fixed_4gb import PreprocessingPipeline
+        except ImportError:
+            console.print("[red]❌ 4GB VRAM pipeline not available. Falling back to transformer-based approach.[/red]")
+            gpu_fixed = False
+    
+    if gpu_fixed:
+        pipeline = PreprocessingPipeline()
+        pipeline.run_full_pipeline_with_monitoring(
+            create_sparse_matrices=True,
+            apply_pca=False,  # Skip PCA for memory
+            save_results=True,
+            use_cache=True,
+            memory_limit_gb=12.0,  # System RAM limit
+            validate_steps=False,  # Skip validation for speed
+            batch_size=batch_size
+        )
+    else:
+        # Use transformer-based approach with fixed ML dataset creation
+        console.print("\n[bold cyan]4GB VRAM Optimized Preprocessing (Transformer-Based)[/bold cyan]")
+        console.print(f"Batch size: {batch_size:,}")
+        
+        start_time = time.time()
+        
+        try:
+            # Initialize components
+            cleaner = DataCleaner()
+            transformer = HyperOptimizedDataTransformer(use_gpu=GPU_TRANSFORMER_AVAILABLE, n_jobs=mp.cpu_count())
+            
+            # Load and clean data
+            ratings_df, movies_df, tags_df = cleaner.load_data()
+            cleaned_ratings = cleaner.clean_ratings(save=False, optimize_memory=True)
+            cleaned_movies = cleaner.clean_movies(save=False)
+            cleaned_tags = cleaner.clean_tags(save=False) if tags_df is not None else None
+            
+            # Run feature engineering
+            console.print("[cyan]Running feature engineering...[/cyan]")
+            features = transformer.create_all_features_pipeline(
+                cleaned_ratings, cleaned_movies, cleaned_tags,
+                batch_size=batch_size
+            )
+            
+            # Create ML datasets
+            console.print("[cyan]Creating ML datasets...[/cyan]")
+            ml_datasets = create_ml_datasets_fixed(
+                cleaned_ratings, features, cleaned_movies, transformer.n_jobs
+            )
+            
+            # Save results
+            console.print("[cyan]Saving results...[/cyan]")
+            save_results_hyper_optimized(features, ml_datasets, transformer.n_jobs)
+            
+            end_time = time.time()
+            total_time = end_time - start_time
+            console.print(f"\n[bold green]✅ Completed in {total_time:.2f} seconds![/bold green]")
+            
+            # Display performance metrics
+            display_hyper_performance_metrics(features, ml_datasets, total_time, transformer.n_jobs)
+            
+        except Exception as e:
+            console.print(f"\n[bold red]❌ Pipeline error: {e}[/bold red]")
+            import traceback
+            console.print(traceback.format_exc())
+        
+        finally:
+            gc.collect()
+            if GPU_TRANSFORMER_AVAILABLE:
+                try:
+                    import cupy as cp
+                    cp.get_default_memory_pool().free_all_blocks()
+                except:
+                    pass
+
 # Support functions for hyper-optimized processing
 def create_ml_datasets_hyper_optimized(ratings_df, features, movies_df, n_jobs):
     """Create ML datasets using hyper-optimized processing."""
@@ -778,6 +1018,131 @@ def create_ml_datasets_hyper_optimized(ratings_df, features, movies_df, n_jobs):
                 ml_datasets[task] = None
     
     return ml_datasets
+
+
+def create_ml_datasets_fixed(ratings_df, features, movies_df, n_jobs):
+    """Fixed ML dataset creation for 4GB VRAM."""
+    from rich.console import Console
+    console = Console()
+    
+    console.print("[cyan]Creating ML datasets (4GB VRAM optimized)...[/cyan]")
+    ml_datasets = {}
+    
+    try:
+        # Get user and movie features
+        user_features = features.get('user_features')
+        movie_features = features.get('movie_features')
+        
+        if user_features is None or movie_features is None:
+            raise ValueError("Missing user or movie features")
+        
+        # Sample for memory efficiency
+        sample_size = min(1_000_000, len(ratings_df))
+        if len(ratings_df) > sample_size:
+            console.print(f"[yellow]Sampling {sample_size:,} ratings[/yellow]")
+            ratings_sample = ratings_df.sample(n=sample_size, random_state=42)
+        else:
+            ratings_sample = ratings_df
+        
+        # Create feature matrix
+        feature_matrix = ratings_sample[['userId', 'movieId', 'rating']].copy()
+        
+        # Add user features (numeric only)
+        user_numeric = user_features.select_dtypes(include=[np.number]).columns.tolist()
+        if len(user_numeric) > 50:  # Limit features
+            user_numeric = user_numeric[:50]
+        
+        for col in user_numeric:
+            feature_matrix[f'user_{col}'] = feature_matrix['userId'].map(
+                user_features[col].to_dict()
+            ).fillna(0)
+        
+        # Add movie features (numeric only)
+        movie_numeric = movie_features.select_dtypes(include=[np.number]).columns.tolist()
+        if len(movie_numeric) > 50:  # Limit features
+            movie_numeric = movie_numeric[:50]
+            
+        for col in movie_numeric:
+            feature_matrix[f'movie_{col}'] = feature_matrix['movieId'].map(
+                movie_features[col].to_dict()
+            ).fillna(0)
+        
+        # Get feature columns
+        feature_cols = [col for col in feature_matrix.columns 
+                       if col not in ['userId', 'movieId', 'rating']]
+        
+        # Extract X and y
+        X = feature_matrix[feature_cols].values.astype(np.float32)
+        y_reg = feature_matrix['rating'].values.astype(np.float32)
+        y_clf = (feature_matrix['rating'] >= 4.0).astype(np.int32)
+        
+        # Create regression dataset
+        ml_datasets['regression'] = {
+            'X': X,
+            'y': y_reg,
+            'feature_names': feature_cols,
+            'n_samples': len(X),
+            'n_features': len(feature_cols)
+        }
+        
+        # Create classification dataset
+        ml_datasets['classification'] = {
+            'X': X,  # Reuse same features
+            'y': y_clf,
+            'feature_names': feature_cols,
+            'n_samples': len(X),
+            'n_features': len(feature_cols),
+            'class_balance': {
+                'positive': np.sum(y_clf == 1) / len(y_clf),
+                'negative': np.sum(y_clf == 0) / len(y_clf)
+            }
+        }
+        
+        # Create user clustering dataset
+        user_numeric_df = user_features.select_dtypes(include=[np.number]).astype(np.float32)
+        if len(user_numeric_df.columns) > 50:
+            user_numeric_df = user_numeric_df.iloc[:, :50]
+        ml_datasets['clustering_users'] = {
+            'X': user_numeric_df.fillna(0).values,
+            'feature_names': user_numeric_df.columns.tolist(),
+            'user_ids': user_features.index.tolist(),
+            'n_samples': len(user_numeric_df),
+            'n_features': len(user_numeric_df.columns)
+        }
+        
+        # Create movie clustering dataset
+        movie_numeric_df = movie_features.select_dtypes(include=[np.number]).astype(np.float32)
+        if len(movie_numeric_df.columns) > 50:
+            movie_numeric_df = movie_numeric_df.iloc[:, :50]
+        ml_datasets['clustering_movies'] = {
+            'X': movie_numeric_df.fillna(0).values,
+            'feature_names': movie_numeric_df.columns.tolist(),
+            'movie_ids': movie_features.index.tolist(),
+            'n_samples': len(movie_numeric_df),
+            'n_features': len(movie_numeric_df.columns)
+        }
+        
+        # Create association rules dataset
+        high_ratings = ratings_sample[ratings_sample['rating'] >= 4.0]
+        transactions = high_ratings.groupby('userId')['movieId'].apply(list).tolist()
+        ml_datasets['association_rules'] = {
+            'transactions': transactions,
+            'movies_df': movies_df,
+            'min_support': 0.01,
+            'min_confidence': 0.5,
+            'n_transactions': len(transactions)
+        }
+        
+        console.print("[green]✓ Successfully created all ML datasets[/green]")
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error creating ML datasets: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
+        ml_datasets = {task: None for task in ['regression', 'classification', 'clustering_users', 'clustering_movies', 'association_rules']}
+    
+    return ml_datasets
+
 
 def create_regression_dataset_optimized(ratings_df, user_features, movie_features):
     """Create optimized regression dataset."""
