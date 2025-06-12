@@ -1073,5 +1073,384 @@ class OptimizedPerformanceConfig:
         self.use_sparse_matrices = True
         self.compress_intermediate_results = True
 
+# Models
+
+@cli.command()
+@click.option('--min-support', type=float, default=0.01, help='Minimum support threshold')
+@click.option('--min-confidence', type=float, default=0.5, help='Minimum confidence threshold')
+@click.option('--top-rules', type=int, default=10, help='Number of top rules to display')
+def association(min_support, min_confidence, top_rules):
+    """Run association rule mining on movie viewing patterns."""
+    from .models.association import run_association_mining_pipeline
+    from .preprocessing.cleaner import DataCleaner
+    
+    console.print(Panel.fit(
+        "[bold cyan]Association Rule Mining[/bold cyan]\n"
+        "Discovering patterns in movie viewing behaviors",
+        border_style="cyan"
+    ))
+    
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, _ = cleaner.load_data()
+    
+    # Run association mining
+    miner = run_association_mining_pipeline(
+        ratings_df, movies_df, 
+        min_support=min_support,
+        min_confidence=min_confidence
+    )
+    
+    # Show top rules
+    console.print(f"\n[bold]Top {top_rules} Association Rules:[/bold]")
+    top_rules_df = miner.get_top_rules(n=top_rules)
+    console.print(top_rules_df)
+    
+    # Show movie bundles
+    console.print("\n[bold]Frequent Movie Bundles:[/bold]")
+    bundles = miner.get_movie_bundles(n=10)
+    console.print(bundles)
+
+
+@cli.command()
+@click.option('--method', type=click.Choice(['all', 'batch', 'sgd', 'mini_batch']), 
+              default='all', help='Gradient descent method to use')
+@click.option('--sample-size', type=int, help='Sample size for faster testing')
+@click.option('--learning-rate', type=float, default=0.01, help='Learning rate')
+@click.option('--iterations', type=int, default=1000, help='Number of iterations')
+def regression(method, sample_size, learning_rate, iterations):
+    """Run regression analysis with gradient descent variants."""
+    from .models.regression import run_regression_pipeline
+    
+    if method == 'all':
+        # Run complete comparison
+        pipeline = run_regression_pipeline(sample_size=sample_size)
+    else:
+        # Run single method
+        console.print(f"[cyan]Running {method} gradient descent regression...[/cyan]")
+        console.print("[yellow]Note: For full comparison, use --method all[/yellow]")
+        
+        from .models.regression import RatingPredictionPipeline
+        pipeline = RatingPredictionPipeline()
+        
+        # Load and prepare data
+        X, y = pipeline.load_ml_dataset()
+        if sample_size and sample_size < len(X):
+            import numpy as np
+            indices = np.random.choice(len(X), sample_size, replace=False)
+            X = X.iloc[indices]
+            y = y.iloc[indices]
+        
+        pipeline.prepare_data(X, y)
+        
+        # Train single method
+        result = pipeline.train_gradient_descent_variant(
+            method=method,
+            learning_rate=learning_rate,
+            n_iterations=iterations
+        )
+        
+        # Display results
+        console.print(f"\n[bold]Results for {method.upper()}:[/bold]")
+        console.print(f"Test RMSE: {result['metrics']['test_rmse']:.4f}")
+        console.print(f"Training Time: {result['training_time']:.2f}s")
+        console.print(f"Iterations: {result['convergence_info']['n_iterations']}")
+
+
+@cli.command()
+@click.option('--user-id', type=int, required=True, help='User ID to get recommendations for')
+@click.option('--n-recommendations', type=int, default=5, help='Number of recommendations')
+@click.option('--method', type=click.Choice(['association', 'collaborative', 'hybrid']), 
+              default='association', help='Recommendation method')
+def recommend(user_id, n_recommendations, method):
+    """Get movie recommendations for a specific user."""
+    from .preprocessing.cleaner import DataCleaner
+    
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, _ = cleaner.load_data()
+    
+    # Check if user exists
+    if user_id not in ratings_df['userId'].unique():
+        console.print(f"[red]User {user_id} not found in dataset[/red]")
+        return
+    
+    if method == 'association':
+        from .models.association import AssociationRuleMiner
+        
+        # Get user's watched movies
+        user_movies = ratings_df[
+            (ratings_df['userId'] == user_id) & 
+            (ratings_df['rating'] >= 4.0)
+        ]['movieId'].tolist()
+        
+        movie_map = dict(zip(movies_df['movieId'], movies_df['title']))
+        watched_titles = [movie_map.get(mid, f"Movie_{mid}") for mid in user_movies]
+        
+        console.print(f"\n[cyan]User {user_id} has watched {len(watched_titles)} highly-rated movies[/cyan]")
+        
+        # Load or create association rules
+        miner = AssociationRuleMiner()
+        if not miner.load_results():
+            console.print("[yellow]Creating association rules (this may take a while)...[/yellow]")
+            miner.prepare_transactions(ratings_df, movies_df)
+            miner.fit_fpgrowth()
+            miner.save_results()
+        
+        # Get recommendations
+        recommendations = miner.get_recommendations(watched_titles, n_recommendations)
+        
+        if recommendations:
+            console.print(f"\n[bold]Top {n_recommendations} Recommendations:[/bold]")
+            table = Table(box="rounded")
+            table.add_column("Movie", style="cyan")
+            table.add_column("Confidence", justify="right", style="green")
+            
+            for movie, confidence in recommendations:
+                table.add_row(movie, f"{confidence:.3f}")
+            
+            console.print(table)
+        else:
+            console.print("[yellow]No recommendations found based on association rules[/yellow]")
+    
+    else:
+        console.print(f"[yellow]{method} recommendation method not yet implemented[/yellow]")
+
+
+
+@cli.command()
+@click.option('--method', type=click.Choice(['kmeans', 'agglomerative', 'both']), 
+              default='both', help='Clustering method for user segmentation')
+@click.option('--n-clusters', type=int, default=8, help='Number of user clusters')
+@click.option('--save-plots', is_flag=True, help='Save visualization plots')
+def user_segmentation(method, n_clusters, save_plots):
+    """Run user segmentation based on rating behaviors."""
+    from .models.clustering import run_user_segmentation_pipeline
+    from .preprocessing.cleaner import DataCleaner
+    
+    console.print(Panel.fit(
+        "[bold cyan]User Segmentation Analysis[/bold cyan]\n"
+        f"Method: {method}, Clusters: {n_clusters}",
+        border_style="cyan"
+    ))
+    
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, _ = cleaner.load_data()
+    
+    # Determine methods to use
+    if method == 'both':
+        methods = ['kmeans', 'agglomerative']
+    else:
+        methods = [method]
+    
+    # Run segmentation
+    results = run_user_segmentation_pipeline(
+        ratings_df, movies_df,
+        n_clusters=n_clusters,
+        methods=methods
+    )
+    
+    # Display comparative results if both methods were used
+    if len(results) > 1:
+        console.print("\n[bold]Method Comparison:[/bold]")
+        comparison_table = Table(box="rounded")
+        comparison_table.add_column("Method", style="cyan")
+        comparison_table.add_column("Clusters", justify="right")
+        comparison_table.add_column("Largest Cluster", justify="right")
+        comparison_table.add_column("Smallest Cluster", justify="right")
+        
+        for method_name, segmentation in results.items():
+            cluster_sizes = segmentation.user_features['cluster'].value_counts()
+            comparison_table.add_row(
+                method_name.title(),
+                str(len(cluster_sizes)),
+                f"{cluster_sizes.max():,} users",
+                f"{cluster_sizes.min():,} users"
+            )
+        
+        console.print(comparison_table)
+
+
+@cli.command()
+@click.option('--linkage', type=click.Choice(['ward', 'complete', 'average', 'single', 'all']), 
+              default='ward', help='Linkage method for hierarchical clustering')
+@click.option('--n-clusters', type=int, help='Number of movie clusters (auto if not specified)')
+@click.option('--use-tags', is_flag=True, help='Include tag features in clustering')
+@click.option('--plot-dendrogram', is_flag=True, help='Generate dendrogram visualization')
+def movie_clustering(linkage, n_clusters, use_tags, plot_dendrogram):
+    """Run hierarchical clustering on movies."""
+    from .models.clustering import run_movie_clustering_pipeline
+    from .preprocessing.cleaner import DataCleaner
+    
+    console.print(Panel.fit(
+        "[bold cyan]Hierarchical Movie Clustering[/bold cyan]\n"
+        f"Linkage: {linkage}, Clusters: {n_clusters or 'Auto'}",
+        border_style="cyan"
+    ))
+    
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, tags_df = cleaner.load_data()
+    
+    if use_tags and tags_df is None:
+        console.print("[yellow]Warning: No tags data available, proceeding without tags[/yellow]")
+        use_tags = False
+    
+    # Determine linkage methods
+    if linkage == 'all':
+        linkage_methods = ['ward', 'complete', 'average', 'single']
+    else:
+        linkage_methods = [linkage]
+    
+    # Run clustering
+    results = run_movie_clustering_pipeline(
+        ratings_df, movies_df,
+        tags_df=tags_df if use_tags else None,
+        linkage_methods=linkage_methods,
+        n_clusters=n_clusters
+    )
+    
+    # Show sample movies from best performing method
+    if len(results) > 1:
+        console.print("\n[yellow]Use --linkage <method> to see detailed results for a specific method[/yellow]")
+
+
+@cli.command()
+@click.option('--compare-methods', is_flag=True, help='Compare different clustering methods')
+@click.option('--cross-analysis', is_flag=True, help='Analyze user-movie cluster interactions')
+def clustering(compare_methods, cross_analysis):
+    """Run complete clustering analysis (users and movies)."""
+    from .models.clustering import run_complete_clustering_analysis
+    from .preprocessing.cleaner import DataCleaner
+    
+    console.print(Panel.fit(
+        "[bold cyan]Complete Clustering Analysis[/bold cyan]\n"
+        "User Segmentation + Hierarchical Movie Clustering",
+        border_style="cyan"
+    ))
+    
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, tags_df = cleaner.load_data()
+    
+    # Check if we need to sample for performance
+    if len(ratings_df) > 5_000_000:
+        if Confirm.ask(f"Dataset has {len(ratings_df):,} ratings. Sample for faster processing?", default=True):
+            sample_size = 2_000_000
+            ratings_df = ratings_df.sample(n=sample_size, random_state=42)
+            console.print(f"[yellow]Sampled {sample_size:,} ratings for analysis[/yellow]")
+    
+    # Run complete analysis
+    results = run_complete_clustering_analysis(ratings_df, movies_df, tags_df)
+    
+    # Generate summary report
+    console.print("\n[bold]Clustering Analysis Summary:[/bold]")
+    
+    # User segmentation summary
+    user_methods = list(results['user_segmentation'].keys())
+    console.print(f"\n[cyan]User Segmentation:[/cyan]")
+    console.print(f"  Methods tested: {', '.join(user_methods)}")
+    console.print(f"  Clusters found: {results['user_segmentation'][user_methods[0]].n_clusters}")
+    
+    # Movie clustering summary  
+    movie_methods = list(results['movie_clustering'].keys())
+    console.print(f"\n[cyan]Movie Clustering:[/cyan]")
+    console.print(f"  Linkage methods tested: {', '.join(movie_methods)}")
+    
+    if cross_analysis and 'patterns' in results['cross_analysis']:
+        patterns = results['cross_analysis']['patterns']
+        console.print(f"\n[cyan]Cross-Analysis:[/cyan]")
+        console.print(f"  Interesting patterns found: {len(patterns)}")
+        console.print(f"  See heatmap in: {REPORTS_DIR / 'user_movie_cluster_heatmap.png'}")
+
+
+@cli.command()
+@click.option('--user-cluster', type=int, help='User cluster ID')
+@click.option('--movie-cluster', type=int, help='Movie cluster ID')
+@click.option('--top-n', type=int, default=10, help='Number of items to show')
+def cluster_details(user_cluster, movie_cluster, top_n):
+    """Show details about specific clusters."""
+    import gzip
+    import pickle
+    
+    results_path = PROCESSED_DATA_DIR / 'clustering_results.pkl.gz'
+    
+    if not results_path.exists():
+        console.print("[red]No clustering results found. Run 'clustering' command first.[/red]")
+        return
+    
+    # Load results
+    with gzip.open(results_path, 'rb') as f:
+        results = pickle.load(f)
+    
+    if user_cluster is not None:
+        # Show user cluster details
+        if 'user_segmentation' not in results or 'kmeans' not in results['user_segmentation']:
+            console.print("[red]User segmentation results not found[/red]")
+            return
+        
+        segmentation = results['user_segmentation']['kmeans']
+        
+        if user_cluster >= segmentation.n_clusters:
+            console.print(f"[red]Invalid user cluster ID. Valid range: 0-{segmentation.n_clusters-1}[/red]")
+            return
+        
+        # Get cluster info
+        cluster_users = segmentation.user_features[segmentation.user_features['cluster'] == user_cluster]
+        cluster_label = segmentation.cluster_labels[user_cluster][1]
+        
+        console.print(f"\n[bold]User Cluster {user_cluster}: {cluster_label}[/bold]")
+        console.print(f"Size: {len(cluster_users):,} users")
+        
+        # Show cluster statistics
+        stats_table = Table(box="rounded")
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Mean", justify="right")
+        stats_table.add_column("Std Dev", justify="right")
+        
+        for col in ['rating_mean', 'rating_count', 'movieId_nunique', 'rating_frequency']:
+            if col in cluster_users.columns:
+                mean_val = cluster_users[col].mean()
+                std_val = cluster_users[col].std()
+                stats_table.add_row(
+                    col.replace('_', ' ').title(),
+                    f"{mean_val:.2f}",
+                    f"{std_val:.2f}"
+                )
+        
+        console.print(stats_table)
+    
+    if movie_cluster is not None:
+        # Show movie cluster details
+        if 'movie_clustering' not in results or 'ward' not in results['movie_clustering']:
+            console.print("[red]Movie clustering results not found[/red]")
+            return
+        
+        clustering = results['movie_clustering']['ward']
+        
+        console.print(f"\n[bold]Movie Cluster {movie_cluster}[/bold]")
+        
+        # Get sample movies
+        sample_movies = clustering.get_cluster_movies(movie_cluster, n=top_n)
+        
+        if not sample_movies.empty:
+            movies_table = Table(box="rounded")
+            movies_table.add_column("Title", style="cyan")
+            movies_table.add_column("Year", justify="right")
+            movies_table.add_column("Avg Rating", justify="right")
+            movies_table.add_column("# Ratings", justify="right")
+            
+            for _, movie in sample_movies.iterrows():
+                movies_table.add_row(
+                    movie['title'][:50] + ('...' if len(movie['title']) > 50 else ''),
+                    str(int(movie['year'])) if pd.notna(movie['year']) else 'N/A',
+                    f"{movie['rating_mean']:.2f}",
+                    f"{int(movie['rating_count']):,}"
+                )
+            
+            console.print(movies_table)
+
+
 if __name__ == '__main__':
     cli()
