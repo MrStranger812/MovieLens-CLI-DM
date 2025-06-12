@@ -295,7 +295,6 @@ Multi-level classification approaches for user and movie categorization:
 #### **Rating Prediction Classification**
 - **Binary Classification**: Predicting user satisfaction (rating ≥ 4.0 vs < 4.0)
 - **Multi-class Classification**: Categorizing ratings into quintiles (very low to very high)
-- **Ordinal Classification**: Respecting the inherent order in rating scales
 
 #### **Content Classification**
 - **Genre Prediction**: Predicting movie genres based on user rating patterns and tags
@@ -342,8 +341,6 @@ Advanced pattern discovery in user behavior and movie relationships:
 
 #### **Advanced Mining Techniques**
 - **FP-Growth Algorithm**: Efficient frequent pattern discovery on large datasets
-- **Constraint-Based Mining**: Focus on specific user segments or time periods
-- **Rare Pattern Discovery**: Finding unusual but significant viewing patterns
 
 ## 📊 Evaluation & Visualization
 
@@ -358,7 +355,7 @@ Advanced pattern discovery in user behavior and movie relationships:
   - Hyperparameter sensitivity analysis
 
 #### **Clustering Evaluation**
-- **Internal Validation**: Silhouette score, Davies-Bouldin index, Calinski-Harabasz score
+- **Internal Validation**: Silhouette score
 - **External Validation**: 
   - Genre purity scores
   - User satisfaction through recommendation quality
