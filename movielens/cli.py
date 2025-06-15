@@ -1451,6 +1451,61 @@ def cluster_details(user_cluster, movie_cluster, top_n):
             
             console.print(movies_table)
 
+@cli.command()
+@click.option('--model', type=click.Choice(['rating', 'genre', 'user_type', 'all']), default='all', help='Classification model to run')
+@click.option('--sample-size', type=int, help='Sample size for faster testing')
+@click.option('--n-jobs', type=int, default=4, help='Number of parallel jobs')
+def classification(model, sample_size, n_jobs):
+    """Run classification models on the dataset."""
+    from .models.classification import (
+        RatingClassifier,
+        GenrePredictor,
+        UserTypeClassifier,
+        run_classification_pipeline
+    )
+    from .preprocessing.cleaner import DataCleaner
+
+    console.print(Panel.fit(
+        "[bold cyan]Classification Models[/bold cyan]\n"
+        f"Model: {model}, Sample Size: {sample_size or 'Full'}, Jobs: {n_jobs}",
+        border_style="cyan"
+    ))
+
+    # Load data
+    cleaner = DataCleaner()
+    ratings_df, movies_df, tags_df = cleaner.load_data()
+
+    # Run all models pipeline
+    if model == 'all':
+        results = run_classification_pipeline(
+            ratings_df=ratings_df,
+            movies_df=movies_df,
+            tags_df=tags_df,
+            sample_size=sample_size,
+            n_jobs=n_jobs
+        )
+        console.print("\n[bold]Classification Results:[/bold]")
+        for name, res in results.items():
+            console.print(f"[cyan]{name}[/cyan]: {res}")
+        return
+
+    # Run individual models
+    if model == 'rating':
+        clf = RatingClassifier(n_jobs=n_jobs)
+        clf.fit(ratings_df, movies_df, sample_size=sample_size)
+        metrics = clf.evaluate()
+        console.print(f"\n[bold]Rating Classifier Results:[/bold] {metrics}")
+    elif model == 'genre':
+        clf = GenrePredictor(n_jobs=n_jobs)
+        clf.fit(ratings_df, movies_df, sample_size=sample_size)
+        metrics = clf.evaluate()
+        console.print(f"\n[bold]Genre Predictor Results:[/bold] {metrics}")
+    elif model == 'user_type':
+        clf = UserTypeClassifier(n_jobs=n_jobs)
+        clf.fit(ratings_df, movies_df, sample_size=sample_size)
+        metrics = clf.evaluate()
+        console.print(f"\n[bold]User Type Classifier Results:[/bold] {metrics}")
+
 
 if __name__ == '__main__':
     cli()
