@@ -15,5 +15,12 @@ from .clustering import (
     run_movie_clustering_pipeline,
     run_complete_clustering_analysis
 )
-from .regression import GradientDescentRegressor, RatingPredictionPipeline, run_regression_pipeline
+
+from .regression import (
+    HyperOptimizedGradientDescent,
+    HybridRatingPredictionPipeline, 
+    run_optimized_regression_pipeline,
+    train_single_gradient_descent_method
+)
+
 from .collaborative import *
