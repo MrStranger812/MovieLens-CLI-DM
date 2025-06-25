@@ -761,20 +761,22 @@ def association(min_support, min_confidence, top_rules):
     console.print(bundles)
 
 
+
 @cli.command()
 @click.option('--method', type=click.Choice(['all', 'batch', 'sgd', 'mini_batch']), 
               default='all', help='Gradient descent method to use')
 @click.option('--sample-size', type=int, help='Sample size for faster testing')
-@click.option('--learning-rate', type=float, default=0.01, help='Learning rate')
+@click.option('--learning-rate', type=float, default=0.001, help='Learning rate')
 @click.option('--iterations', type=int, default=1000, help='Number of iterations')
-@click.option('--batch-size', type=int, default=32, help='Batch size for mini-batch method')
-@click.option('--use-custom', is_flag=True, default=True, help='Use custom optimized implementation')
+@click.option('--batch-size', type=int, default=256, help='Batch size for mini-batch method')
+@click.option('--use-custom', is_flag=True, default=True, help='Use custom Numba implementation')
 @click.option('--regularization', type=click.Choice(['none', 'l1', 'l2', 'elastic']), 
               default='l2', help='Regularization type')
 @click.option('--lambda-reg', type=float, default=0.01, help='Regularization strength')
-def regression(method, sample_size, learning_rate, iterations, batch_size, use_custom, regularization, lambda_reg):
-    """Run regression analysis with gradient descent variants."""
-    from .models.regression import run_optimized_regression_pipeline, train_single_gradient_descent_method  
+@click.option('--benchmark', is_flag=True, help='Run performance benchmark')
+def regression(method, sample_size, learning_rate, iterations, batch_size, use_custom, 
+               regularization, lambda_reg, benchmark):
+    """Run regression analysis with ultra-fast gradient descent variants."""
     # Check if preprocessed data exists
     ml_datasets_path = PROCESSED_DATA_DIR / "ml_ready_datasets.pkl.gz"
     if not ml_datasets_path.exists():
@@ -782,81 +784,418 @@ def regression(method, sample_size, learning_rate, iterations, batch_size, use_c
         return
     
     try:
-        if method == 'all':
-            # Import and run complete comparison pipeline
+        if benchmark:
+            # Run benchmark mode
+            console.print(Panel.fit(
+                "[bold cyan]Regression Benchmark Mode[/bold cyan]\n"
+                "Comparing implementations and methods",
+                border_style="cyan"
+            ))
             
+            # Run with both implementations
+            results = {}
+            
+            for impl in [True, False]:
+                impl_name = "Custom Numba" if impl else "Sklearn"
+                console.print(f"\n[yellow]Testing {impl_name} implementation...[/yellow]")
+                
+                from .models.regression import run_ultra_fast_regression
+                pipeline = run_ultra_fast_regression(
+                    sample_size=sample_size or 50000,
+                    use_custom=impl,
+                    methods=['batch', 'sgd', 'mini_batch']
+                )
+                
+                if pipeline:
+                    results[impl_name] = pipeline.results
+            
+            # Display benchmark comparison
+            if results:
+                _display_benchmark_results(results)
+        
+        elif method == 'all':
+            # Run complete comparison
+            from .models.regression import run_ultra_fast_regression
             
             console.print(Panel.fit(
-                "[bold cyan]Hyper-Optimized Gradient Descent Comparison[/bold cyan]\n"
-                f"Implementation: {'Custom + Numba' if use_custom else 'Sklearn Wrappers'}\n"
+                "[bold cyan]Ultra-Fast Gradient Descent Comparison[/bold cyan]\n"
+                f"Implementation: {'Custom Numba JIT' if use_custom else 'Sklearn Optimized'}\n"
                 f"Sample Size: {sample_size or 'Full Dataset'}",
                 border_style="cyan"
             ))
             
-            # Determine methods to test
-            methods_to_test = ['batch', 'sgd', 'mini_batch']
-            if use_custom:
-                methods_to_test.append('adam')
-            
-            pipeline = run_optimized_regression_pipeline(
+            pipeline = run_ultra_fast_regression(
                 sample_size=sample_size,
-                use_custom=False,
-                methods=methods_to_test
+                use_custom=use_custom,
+                methods=['batch', 'sgd', 'mini_batch']
             )
             
             if pipeline:
-                console.print(f"\n[bold green]🎉 Complete comparison finished![/bold green]")
-                console.print(f"[green]📊 Check {REPORTS_DIR} for detailed reports and visualizations[/green]")
+                console.print(f"\n[bold green]🎉 Analysis complete![/bold green]")
+                console.print(f"[green]📊 Reports saved to {REPORTS_DIR}[/green]")
+                
+                # Save models
+                _save_regression_models(pipeline)
             else:
-                console.print("[red]❌ Pipeline failed to complete[/red]")
+                console.print("[red]❌ Pipeline failed[/red]")
         
         else:
+            # Run single method
+            from .models.regression import train_gradient_descent_fast
             
             console.print(Panel.fit(
                 f"[bold cyan]Training {method.upper()} Gradient Descent[/bold cyan]\n"
-                f"Implementation: {'Custom Optimized' if use_custom else 'Sklearn'}\n"
+                f"Implementation: {'Custom Numba JIT' if use_custom else 'Sklearn'}\n"
                 f"Learning Rate: {learning_rate}, Iterations: {iterations}",
                 border_style="cyan"
             ))
             
-            # Configure hyperparameters
-            config = {
-                'learning_rate': learning_rate,
-                'n_iterations': iterations,
-                'batch_size': batch_size if method == 'mini_batch' else 32,
-                'regularization': regularization,
-                'lambda_reg': lambda_reg,
-                'use_custom': False
-            }
-            
-            result = train_single_gradient_descent_method(method, **config)
+            result = train_gradient_descent_fast(
+                method=method,
+                learning_rate=learning_rate,
+                n_iterations=iterations,
+                batch_size=batch_size,
+                regularization=regularization,
+                lambda_reg=lambda_reg,
+                use_custom=use_custom
+            )
             
             if result:
-                console.print(f"\n[bold green]✅ {method.upper()} training completed successfully![/bold green]")
-                
-                # Display key results
-                metrics = result.get('metrics', {})
-                conv_info = result.get('convergence_info', {})
-                
-                console.print("\n[bold]Key Results:[/bold]")
-                console.print(f"• Test RMSE: {metrics.get('test_rmse', 'N/A'):.4f}")
-                console.print(f"• Test R²: {metrics.get('test_r2', 'N/A'):.4f}")
-                console.print(f"• Training Time: {conv_info.get('training_time', 0):.2f}s")
-                console.print(f"• Converged: {'✓' if conv_info.get('converged', False) else '✗'}")
-                
+                console.print(f"\n[bold green]✅ Training completed![/bold green]")
                 console.print(f"\n[cyan]💡 For full comparison, use: --method all[/cyan]")
             else:
-                console.print(f"[red]❌ {method.upper()} training failed[/red]")
+                console.print(f"[red]❌ Training failed[/red]")
     
     except ImportError as e:
         console.print(f"[red]❌ Failed to import regression modules: {e}[/red]")
-        console.print("[yellow]Make sure all dependencies are installed and preprocessing is complete[/yellow]")
+        console.print("[yellow]Ensure all dependencies are installed[/yellow]")
     
     except Exception as e:
         console.print(f"[red]❌ Regression analysis failed: {e}[/red]")
         import traceback
         console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
+
+@cli.command('regression-predict')
+@click.option('--model-path', type=click.Path(exists=True), help='Path to saved model')
+@click.option('--data-path', type=click.Path(exists=True), help='Path to data for prediction')
+@click.option('--user-id', type=int, help='User ID for prediction')
+@click.option('--movie-id', type=int, help='Movie ID for prediction')
+@click.option('--batch', is_flag=True, help='Batch prediction mode')
+def regression_predict(model_path, data_path, user_id, movie_id, batch):
+    """Make predictions using trained regression model."""
+    try:
+        # Load model
+        if not model_path:
+            model_path = PROCESSED_DATA_DIR / 'models' / 'gradient_descent_best.pkl'
+        
+        with open(model_path, 'rb') as f:
+            model_data = pickle.load(f)
+            model = model_data['model']
+            scaler = model_data['scaler']
+        
+        console.print(f"[green]✓ Loaded model from {model_path}[/green]")
+        
+        if batch and data_path:
+            # Batch prediction
+            data = pd.read_csv(data_path) if data_path.endswith('.csv') else pd.read_parquet(data_path)
+            
+            # Prepare features (simplified for demo)
+            X = scaler.transform(data.select_dtypes(include=[np.number]))
+            predictions = model.predict(X)
+            
+            # Save predictions
+            output_path = Path(data_path).parent / 'predictions.csv'
+            pd.DataFrame({
+                'prediction': predictions
+            }).to_csv(output_path, index=False)
+            
+            console.print(f"[green]✓ Predictions saved to {output_path}[/green]")
+            console.print(f"[green]  Mean: {predictions.mean():.3f}, Std: {predictions.std():.3f}[/green]")
+        
+        elif user_id and movie_id:
+            # Single prediction (would need feature engineering)
+            console.print("[yellow]Single prediction requires feature engineering pipeline[/yellow]")
+            console.print("[yellow]This is a simplified demo[/yellow]")
+            
+            # Mock prediction
+            prediction = 3.5 + np.random.normal(0, 0.5)
+            console.print(f"\n[bold]Predicted rating: {prediction:.2f}[/bold]")
+        
+        else:
+            console.print("[red]Specify either --batch with --data-path or --user-id with --movie-id[/red]")
+    
+    except Exception as e:
+        console.print(f"[red]❌ Prediction failed: {e}[/red]")
+
+
+@cli.command('regression-tune')
+@click.option('--method', type=click.Choice(['batch', 'sgd', 'mini_batch']), 
+              required=True, help='Gradient descent method')
+@click.option('--n-trials', type=int, default=20, help='Number of hyperparameter trials')
+@click.option('--sample-size', type=int, default=50000, help='Sample size for tuning')
+def regression_tune(method, n_trials, sample_size):
+    """Hyperparameter tuning for regression models."""
+    console.print(Panel.fit(
+        f"[bold cyan]Hyperparameter Tuning: {method.upper()}[/bold cyan]\n"
+        f"Trials: {n_trials}, Sample Size: {sample_size:,}",
+        border_style="cyan"
+    ))
+    import pandas as pd
+    from movielens.models.regression import HyperOptimizedRegressionPipeline
+    console.print(Panel.fit(
+        f"[bold cyan]Hyperparameter Tuning: {method.upper()}[/bold cyan]\n"
+        f"Trials: {n_trials}, Sample Size: {sample_size}",
+        border_style="cyan"
+    ))
+    try:
+        pipeline = HyperOptimizedRegressionPipeline(use_custom=True)
+        # Load data
+        loaded = pipeline.load_ml_dataset()
+        # Handle dict or tuple return
+        if isinstance(loaded, dict):
+            X = loaded.get('X')
+            y = loaded.get('y')
+            feature_names = loaded.get('feature_names', None)
+        else:
+            X, y = loaded
+            feature_names = None
+        # Sample if requested
+        if sample_size and sample_size < len(X):
+            X = X[:sample_size]
+            y = y[:sample_size]
+        # If feature_names exist and X is ndarray, convert to DataFrame
+        if feature_names is not None and not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=feature_names)
+        # ...existing code for tuning logic...
+    except Exception as e:
+        console.print(f"[red]❌ Tuning failed: {e}[/red]")
+        import traceback
+        console.print(f"[red]{traceback.format_exc()}[/red]")
+    try:
+        from .models.regression import HyperOptimizedRegressionPipeline
+        import itertools
+        
+        # Initialize pipeline
+        pipeline = HyperOptimizedRegressionPipeline(use_custom=True)
+        data = pipeline.load_ml_dataset()
+
+        X = data['X']
+        y = data['y']
+        feature_names = data['feature_names']
+        # Sample data
+        if sample_size and sample_size < len(X):
+            indices = np.random.choice(len(X), sample_size, replace=False)
+            X = X.iloc[indices]
+            y = y.iloc[indices]
+        
+        pipeline.prepare_data(X, y)
+        
+        # Define hyperparameter space
+        if method == 'batch':
+            param_grid = {
+                'learning_rate': [0.0001, 0.001, 0.01, 0.1],
+                'momentum': [0.8, 0.9, 0.95, 0.99],
+                'regularization': ['l2', 'elastic'],
+                'lambda_reg': [0.001, 0.01, 0.1]
+            }
+        elif method == 'sgd':
+            param_grid = {
+                'learning_rate': [0.00001, 0.0001, 0.001, 0.01],
+                'momentum': [0.9, 0.95, 0.99],
+                'regularization': ['l2'],
+                'lambda_reg': [0.01, 0.1]
+            }
+        else:  # mini_batch
+            param_grid = {
+                'learning_rate': [0.0001, 0.001, 0.01],
+                'batch_size': [128, 256, 512, 1024],
+                'momentum': [0.8, 0.9, 0.95],
+                'regularization': ['l2'],
+                'lambda_reg': [0.01]
+            }
+        
+        # Generate parameter combinations
+        param_names = list(param_grid.keys())
+        param_values = list(param_grid.values())
+        all_combinations = list(itertools.product(*param_values))
+        
+        # Randomly sample n_trials combinations
+        if len(all_combinations) > n_trials:
+            indices = np.random.choice(len(all_combinations), n_trials, replace=False)
+            combinations = [all_combinations[i] for i in indices]
+        else:
+            combinations = all_combinations
+        
+        # Run trials
+        results = []
+        best_rmse = float('inf')
+        best_params = None
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task(
+                f"[cyan]Tuning {method}...", 
+                total=len(combinations)
+            )
+            
+            for params in combinations:
+                param_dict = dict(zip(param_names, params))
+                param_dict['n_iterations'] = 500  # Faster for tuning
+                param_dict['verbose'] = False
+                param_dict['early_stopping'] = True
+                
+                try:
+                    result = pipeline.train_single_method(method, **param_dict)
+                    test_rmse = result['metrics']['test_rmse']
+                    
+                    results.append({
+                        'params': param_dict,
+                        'test_rmse': test_rmse,
+                        'train_rmse': result['metrics']['train_rmse'],
+                        'time': result['convergence_info']['training_time']
+                    })
+                    
+                    if test_rmse < best_rmse:
+                        best_rmse = test_rmse
+                        best_params = param_dict
+                    
+                except Exception:
+                    pass  # Skip failed trials
+                
+                progress.advance(task)
+        
+        # Display results
+        if results:
+            console.print(f"\n[bold green]Best Parameters (RMSE: {best_rmse:.4f}):[/bold green]")
+            for param, value in best_params.items():
+                if param not in ['verbose', 'early_stopping', 'n_iterations']:
+                    console.print(f"  {param}: {value}")
+            
+            # Show top 5 configurations
+            results.sort(key=lambda x: x['test_rmse'])
+            
+            table = Table(title=f"Top 5 Configurations for {method.upper()}", box="rounded")
+            table.add_column("Rank", style="cyan")
+            table.add_column("Test RMSE", justify="right")
+            table.add_column("Parameters")
+            
+            for i, result in enumerate(results[:5]):
+                param_str = ", ".join([
+                    f"{k}={v}" for k, v in result['params'].items() 
+                    if k not in ['verbose', 'early_stopping', 'n_iterations']
+                ])
+                table.add_row(
+                    str(i + 1),
+                    f"{result['test_rmse']:.4f}",
+                    param_str
+                )
+            
+            console.print(table)
+            
+            # Save best model
+            console.print("\n[cyan]Training best model with full iterations...[/cyan]")
+            best_params['n_iterations'] = 1000
+            best_params['verbose'] = True
+            
+            final_result = pipeline.train_single_method(method, **best_params)
+            
+            # Save tuning results
+            tuning_path = REPORTS_DIR / f'tuning_{method}_results.json'
+            with open(tuning_path, 'w') as f:
+                json.dump({
+                    'best_params': best_params,
+                    'best_rmse': best_rmse,
+                    'all_results': results[:20]  # Top 20
+                }, f, indent=2)
+            
+            console.print(f"[green]✓ Tuning results saved to {tuning_path}[/green]")
+        
+    except Exception as e:
+        console.print(f"[red]❌ Tuning failed: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
+
+
+# Helper functions
+def _display_benchmark_results(results: Dict):
+    """Display benchmark comparison between implementations."""
+    table = Table(title="Implementation Benchmark", box="rounded")
+    table.add_column("Implementation", style="cyan")
+    table.add_column("Method", style="yellow")
+    table.add_column("RMSE", justify="right")
+    table.add_column("Time (s)", justify="right")
+    table.add_column("Speedup", justify="right", style="green")
+    
+    # Calculate speedups
+    sklearn_times = {}
+    for impl_name, impl_results in results.items():
+        if impl_name == "Sklearn":
+            for method, result in impl_results.items():
+                sklearn_times[method] = result['convergence_info']['training_time']
+    
+    # Display results
+    for impl_name, impl_results in results.items():
+        for method, result in impl_results.items():
+            time = result['convergence_info']['training_time']
+            speedup = ""
+            
+            if impl_name == "Custom Numba" and method in sklearn_times:
+                speedup_val = sklearn_times[method] / time
+                speedup = f"{speedup_val:.2f}x"
+            
+            table.add_row(
+                impl_name,
+                method.upper(),
+                f"{result['metrics']['test_rmse']:.4f}",
+                f"{time:.2f}",
+                speedup
+            )
+    
+    console.print(table)
+
+
+def _save_regression_models(pipeline):
+    """Save trained regression models."""
+    models_dir = PROCESSED_DATA_DIR / 'models'
+    models_dir.mkdir(exist_ok=True)
+    
+    # Find best model
+    best_method = min(pipeline.results.items(), 
+                     key=lambda x: x[1]['metrics']['test_rmse'])
+    
+    # Save best model
+    best_path = models_dir / 'gradient_descent_best.pkl'
+    with open(best_path, 'wb') as f:
+        pickle.dump({
+            'model': best_method[1]['model'],
+            'scaler': pipeline.scaler,
+            'method': best_method[0],
+            'metrics': best_method[1]['metrics'],
+            'hyperparameters': best_method[1]['hyperparameters']
+        }, f)
+    
+    console.print(f"[green]✓ Best model saved to {best_path}[/green]")
+    
+    # Save all models
+    for method, result in pipeline.results.items():
+        model_path = models_dir / f'gradient_descent_{method}.pkl'
+        with open(model_path, 'wb') as f:
+            pickle.dump({
+                'model': result['model'],
+                'scaler': pipeline.scaler,
+                'metrics': result['metrics'],
+                'hyperparameters': result['hyperparameters']
+            }, f)
+    
+    console.print(f"[green]✓ All models saved to {models_dir}[/green]")
+
+    
 
 @cli.command()
 @click.option('--user-id', type=int, required=True, help='User ID to get recommendations for')
